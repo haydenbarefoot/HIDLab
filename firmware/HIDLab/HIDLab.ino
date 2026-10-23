@@ -3,8 +3,7 @@
  * HIDLab firmware
  * Target: Arduino Nano ESP32
  *
- * Hosts a Wi-Fi control interface and sends queued ASCII text
- * through the native USB HID keyboard interface.
+ * Wi-Fi-controlled USB HID keyboard research platform.
  */
 
 #include <Arduino.h>
@@ -14,37 +13,35 @@
 #include <USB.h>
 #include <USBHIDKeyboard.h>
 
-#include "wifi_credentials.h"
 #include "PassageQueue.h"
+#include "NetworkManager.h"
 #include "WebPage.h"
 
-constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
 constexpr unsigned long KEY_INTERVAL_MS = 150;
+constexpr unsigned long SESSION_TIMEOUT_MS = 30000;
 constexpr size_t MAX_REQUEST_BYTES = 32000;
 
 WebServer server(80);
 PassageQueue passageQueue;
+NetworkManager networkManager;
 USBHIDKeyboard Keyboard;
 
-unsigned long lastWifiAttempt = 0;
 unsigned long lastKeyTime = 0;
-bool wasConnected = false;
+unsigned long lastSessionActivity = 0;
+
+String activeSession;
 
 
-/**
- * Accept printable ASCII, tabs, and line endings.
- */
+/** Check that a passage contains only supported ASCII text. */
 bool isSupportedText(const String& text) {
     for (size_t i = 0; i < text.length(); ++i) {
-        unsigned char character = text[i];
+        const unsigned char ch = text[i];
 
-        if (character >= 32 && character <= 126) {
+        if (ch >= 32 && ch <= 126) {
             continue;
         }
 
-        if (character == '\n' ||
-            character == '\r' ||
-            character == '\t') {
+        if (ch == '\n' || ch == '\r' || ch == '\t') {
             continue;
         }
 
@@ -55,36 +52,110 @@ bool isSupportedText(const String& text) {
 }
 
 
-/**
- * Serialize and send a JSON response.
- */
+/** Send a JSON document as an HTTP response. */
 void sendJson(int statusCode, const JsonDocument& document) {
-    String response;
-    serializeJson(document, response);
+    String body;
+    serializeJson(document, body);
 
     server.send(
         statusCode,
         "application/json; charset=utf-8",
-        response
+        body
     );
 }
 
 
-/**
- * Return an API error response.
- */
+/** Send a consistent JSON error response. */
 void sendError(int statusCode, const char* message) {
     JsonDocument response;
     response["ok"] = false;
     response["error"] = message;
-
     sendJson(statusCode, response);
 }
 
 
+/** Parse the incoming JSON request body. */
+bool readRequest(JsonDocument& request) {
+    if (!server.hasArg("plain")) {
+        sendError(400, "Missing request body.");
+        return false;
+    }
+
+    const String body = server.arg("plain");
+
+    if (body.isEmpty() || body.length() > MAX_REQUEST_BYTES) {
+        sendError(413, "Invalid request size.");
+        return false;
+    }
+
+    if (deserializeJson(request, body) ||
+        !request.is<JsonObject>()) {
+        sendError(400, "Invalid JSON request.");
+        return false;
+    }
+
+    return true;
+}
+
+
 /**
- * Serve the HIDLab control interface.
+ * Check whether the browser holds the active control session.
+ *
+ * Sessions prevent simultaneous commands from different browsers.
+ * They are not authentication against other devices on the LAN.
  */
+bool authorizeSession() {
+    const String token = server.header("X-HIDLab-Session");
+
+    if (token.isEmpty() || token != activeSession) {
+        sendError(423, "Another controller owns this session.");
+        return false;
+    }
+
+    lastSessionActivity = millis();
+    return true;
+}
+
+
+/**
+ * Acquire or renew the single-controller session.
+ *
+ * An inactive session expires after 30 seconds.
+ */
+void handleSession() {
+    JsonDocument request;
+
+    if (!readRequest(request)) {
+        return;
+    }
+
+    const String token = request["token"] | "";
+
+    if (token.length() < 16 || token.length() > 128) {
+        sendError(400, "Invalid session token.");
+        return;
+    }
+
+    const bool expired =
+        millis() - lastSessionActivity >= SESSION_TIMEOUT_MS;
+
+    if (!activeSession.isEmpty() &&
+        activeSession != token &&
+        !expired) {
+        sendError(423, "Another controller is connected.");
+        return;
+    }
+
+    activeSession = token;
+    lastSessionActivity = millis();
+
+    JsonDocument response;
+    response["ok"] = true;
+    sendJson(200, response);
+}
+
+
+/** Serve the control webpage from firmware flash. */
 void handleRoot() {
     server.send_P(
         200,
@@ -94,16 +165,18 @@ void handleRoot() {
 }
 
 
-/**
- * Return playback status and waiting passages.
- */
+/** Return the current queue and playback state. */
 void handleStatus() {
     JsonDocument response;
 
     response["status"] = passageQueue.statusName();
     response["queued"] = passageQueue.waitingCount();
+    response["network"] = networkManager.currentSSID();
+    response["ip"] = networkManager.address();
+    response["setup_mode"] = networkManager.setupMode();
 
-    JsonArray passages = response["passages"].to<JsonArray>();
+    JsonArray passages =
+        response["passages"].to<JsonArray>();
 
     for (size_t i = 0; i < passageQueue.waitingCount(); ++i) {
         passages.add(passageQueue.passage(i));
@@ -113,138 +186,82 @@ void handleStatus() {
 }
 
 
-/**
- * Process queue and playback commands from the web interface.
- */
+/** Execute passage queue and playback commands. */
 void handleAction() {
-    if (!server.hasArg("plain")) {
-        sendError(400, "Missing request body.");
-        return;
-    }
-
-    String body = server.arg("plain");
-
-    if (body.isEmpty() || body.length() > MAX_REQUEST_BYTES) {
-        sendError(413, "Invalid request size.");
+    if (!authorizeSession()) {
         return;
     }
 
     JsonDocument request;
-    DeserializationError error = deserializeJson(request, body);
 
-    if (error || !request.is<JsonObject>()) {
-        sendError(400, "Invalid JSON request.");
+    if (!readRequest(request)) {
         return;
     }
 
-    const char* action = request["action"] | "";
+    const String action = request["action"] | "";
+    const int index = request["index"].is<int>()
+        ? request["index"].as<int>()
+        : -1;
 
     bool success = false;
     const char* message = "Unknown action.";
 
-    if (strcmp(action, "add") == 0 ||
-        strcmp(action, "edit") == 0) {
-
+    if (action == "add" || action == "edit") {
         if (!request["text"].is<const char*>()) {
-            sendError(400, "Passage text must be a string.");
+            sendError(400, "Text must be a string.");
             return;
         }
 
-        String text = request["text"].as<String>();
+        const String text = request["text"].as<String>();
 
         if (!isSupportedText(text)) {
-            sendError(400, "Only basic ASCII text is supported.");
+            sendError(400, "Only ASCII text is supported.");
             return;
         }
 
-        if (strcmp(action, "add") == 0) {
+        if (action == "add") {
             success = passageQueue.add(text);
-
-            message = success
-                ? "Passage added."
-                : "Invalid passage or queue is full.";
-
-        } else {
-            if (!request["index"].is<int>()) {
-                sendError(400, "Invalid queue position.");
-                return;
-            }
-
-            int index = request["index"].as<int>();
-
-            success = index >= 0 &&
-                passageQueue.edit(
-                    static_cast<size_t>(index),
-                    text
-                );
-
-            message = success
-                ? "Passage updated."
-                : "Invalid passage or queue position.";
+        } else if (index >= 0) {
+            success = passageQueue.edit(index, text);
         }
 
-    } else if (strcmp(action, "remove") == 0) {
+        message = success
+            ? "Passage saved."
+            : "Invalid passage or queue position.";
 
-        if (!request["index"].is<int>()) {
-            sendError(400, "Invalid queue position.");
-            return;
-        }
-
-        int index = request["index"].as<int>();
-
-        success = index >= 0 &&
-            passageQueue.remove(static_cast<size_t>(index));
-
+    } else if (action == "remove") {
+        success = index >= 0 && passageQueue.remove(index);
         message = success
             ? "Passage removed."
             : "Invalid queue position.";
 
-    } else if (strcmp(action, "move") == 0) {
+    } else if (action == "move") {
+        const String direction = request["direction"] | "";
 
-        if (!request["index"].is<int>() ||
-            !request["direction"].is<const char*>()) {
-            sendError(400, "Invalid move parameters.");
-            return;
-        }
-
-        int index = request["index"].as<int>();
-        String direction = request["direction"].as<String>();
-
-        int offset = 0;
-
-        if (direction == "up") {
-            offset = -1;
-        } else if (direction == "down") {
-            offset = 1;
-        }
+        const int offset =
+            direction == "up" ? -1 :
+            direction == "down" ? 1 : 0;
 
         success = index >= 0 && offset != 0 &&
-            passageQueue.move(
-                static_cast<size_t>(index),
-                offset
-            );
+                  passageQueue.move(index, offset);
 
         message = success
             ? "Queue order updated."
             : "Invalid move.";
 
-    } else if (strcmp(action, "start") == 0) {
-
+    } else if (action == "start") {
         success = passageQueue.start();
         message = success ? "Started." : "Cannot start.";
 
         if (success) {
-            // Schedule the first character after Start.
             lastKeyTime = millis();
         }
 
-    } else if (strcmp(action, "pause") == 0) {
-
+    } else if (action == "pause") {
         success = passageQueue.pause();
         message = success ? "Paused." : "Cannot pause.";
 
-    } else if (strcmp(action, "resume") == 0) {
-
+    } else if (action == "resume") {
         success = passageQueue.resume();
         message = success ? "Resumed." : "Cannot resume.";
 
@@ -252,8 +269,7 @@ void handleAction() {
             lastKeyTime = millis();
         }
 
-    } else if (strcmp(action, "stop") == 0) {
-
+    } else if (action == "stop") {
         success = passageQueue.stop();
         message = success
             ? "Stopped. Passage returned to queue."
@@ -268,13 +284,81 @@ void handleAction() {
 }
 
 
-/**
- * Register the HTTP routes.
- */
+/** Return saved Wi-Fi network names without their passwords. */
+void handleNetworks() {
+    JsonDocument response;
+
+    JsonArray networks =
+        response["networks"].to<JsonArray>();
+
+    for (int i = 0; i < networkManager.networkCount(); ++i) {
+        networks.add(networkManager.networkName(i));
+    }
+
+    sendJson(200, response);
+}
+
+
+/** Add, update, or remove a saved Wi-Fi profile. */
+void handleNetworkAction() {
+    if (!authorizeSession()) {
+        return;
+    }
+
+    JsonDocument request;
+
+    if (!readRequest(request)) {
+        return;
+    }
+
+    const String action = request["action"] | "";
+    bool success = false;
+
+    if (action == "add") {
+        if (!request["ssid"].is<const char*>() ||
+            !request["password"].is<const char*>()) {
+            sendError(400, "Invalid network configuration.");
+            return;
+        }
+
+        success = networkManager.addNetwork(
+            request["ssid"].as<String>(),
+            request["password"].as<String>()
+        );
+
+    } else if (action == "remove") {
+        const int index = request["index"].is<int>()
+            ? request["index"].as<int>()
+            : -1;
+
+        success = networkManager.removeNetwork(index);
+    }
+
+    JsonDocument response;
+    response["ok"] = success;
+    response["message"] = success
+        ? "Network configuration saved."
+        : "Network configuration rejected.";
+
+    sendJson(success ? 200 : 400, response);
+}
+
+
+/** Register HTTP endpoints used by the HIDLab interface. */
 void configureServer() {
+    const char* headers[] = {"X-HIDLab-Session"};
+    server.collectHeaders(headers, 1);
+
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/session", HTTP_POST, handleSession);
     server.on("/api/action", HTTP_POST, handleAction);
+    server.on("/api/networks", HTTP_GET, handleNetworks);
+    server.on(
+        "/api/networks/action",
+        HTTP_POST,
+        handleNetworkAction
+    );
 
     server.onNotFound([]() {
         sendError(404, "Not found.");
@@ -285,53 +369,17 @@ void configureServer() {
 
 
 /**
- * Initiate a connection to the configured Wi-Fi network.
- */
-void connectWifi() {
-    Serial.println("Connecting to Wi-Fi...");
-
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiAttempt = millis();
-}
-
-
-/**
- * Monitor Wi-Fi connectivity and retry when disconnected.
- */
-void maintainWifi() {
-    bool connected = WiFi.status() == WL_CONNECTED;
-
-    if (connected && !wasConnected) {
-        Serial.println("Wi-Fi connected.");
-        Serial.print("HIDLab address: http://");
-        Serial.println(WiFi.localIP());
-    }
-
-    if (!connected && wasConnected) {
-        Serial.println("Wi-Fi disconnected.");
-    }
-
-    wasConnected = connected;
-
-    if (!connected &&
-        millis() - lastWifiAttempt >= WIFI_RETRY_INTERVAL_MS) {
-        connectWifi();
-    }
-}
-
-
-/**
- * Process one queued character when playback is active.
+ * Send the next ASCII character while playback is active.
  *
- * HTTP processing remains responsive because this function
- * does not wait between characters.
+ * The current queue implementation advances before USB
+ * delivery is confirmed. USB recovery remains provisional.
  */
 void processKeyboard() {
     if (passageQueue.state() != PassageQueue::State::Typing) {
         return;
     }
 
-    unsigned long now = millis();
+    const unsigned long now = millis();
 
     if (now - lastKeyTime < KEY_INTERVAL_MS) {
         return;
@@ -345,8 +393,8 @@ void processKeyboard() {
         return;
     }
 
-    // Normalize line endings for USB keyboard output.
-    // Windows CRLF passages require separate handling later.
+    // Ignore carriage returns so Windows CRLF becomes
+    // a single Enter event rather than two line breaks.
     if (character == '\r') {
         return;
     }
@@ -355,36 +403,29 @@ void processKeyboard() {
 }
 
 
-/**
- * Initialize USB HID, networking, and the HTTP server.
- */
+/** Initialize the USB device and network services. */
 void setup() {
     Serial.begin(115200);
 
     Keyboard.begin();
     USB.begin();
 
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-
     configureServer();
-    connectWifi();
+    networkManager.begin();
 
     Serial.println("HIDLab initialized.");
 }
 
 
-/**
- * Service Wi-Fi, HTTP requests, and keyboard output.
- */
+/** Service network, HTTP, and keyboard operations. */
 void loop() {
-    maintainWifi();
+    networkManager.update();
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (networkManager.connected() ||
+        networkManager.setupMode()) {
         server.handleClient();
     }
 
     processKeyboard();
-
     delay(1);
 }

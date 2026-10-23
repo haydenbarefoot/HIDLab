@@ -3,7 +3,6 @@
 
 #include <Arduino.h>
 
-// Browser interface stored in firmware flash memory.
 const char INDEX_HTML[] PROGMEM = R"hidlab(
 <!DOCTYPE html>
 <html lang="en">
@@ -24,376 +23,485 @@ const char INDEX_HTML[] PROGMEM = R"hidlab(
 
     main {
       max-width: 650px;
-      margin: 30px auto;
+      margin: 32px auto;
       padding: 16px;
     }
 
     h1 { margin-bottom: 4px; }
+    p, .muted { color: #9ca3af; }
 
-    p { color: #9ca3af; }
-
-    .panel {
+    section {
       background: #1f2937;
       padding: 20px;
       border-radius: 12px;
-      margin-top: 20px;
+      margin-top: 18px;
     }
 
-    textarea {
+    input, textarea {
       width: 100%;
-      min-height: 150px;
       padding: 12px;
+      margin: 6px 0;
       background: #111827;
       color: white;
       border: 1px solid #4b5563;
       border-radius: 8px;
       font: inherit;
+    }
+
+    textarea {
+      min-height: 140px;
       resize: vertical;
     }
 
     button {
-      padding: 10px 12px;
-      background: #374151;
       border: 0;
+      padding: 10px 12px;
       border-radius: 8px;
+      background: #374151;
       color: white;
       font: inherit;
       cursor: pointer;
     }
 
     button:disabled {
-      opacity: 0.4;
+      opacity: .4;
       cursor: default;
     }
 
     .primary { background: #2563eb; }
     .danger { background: #991b1b; }
-
-    .full-width {
-      width: 100%;
-      margin-top: 12px;
-    }
+    .full { width: 100%; margin-top: 8px; }
 
     .controls {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
+      grid-template-columns: 1fr 1fr;
       gap: 10px;
-    }
-
-    #status { font-weight: bold; }
-    #message { min-height: 20px; }
-
-    #queue {
-      list-style: none;
-      padding: 0;
-    }
-
-    .queue-item {
-      padding: 12px 0;
-      border-bottom: 1px solid #374151;
-    }
-
-    .preview {
-      overflow-wrap: anywhere;
-      margin-bottom: 10px;
     }
 
     .actions {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+      margin: 10px 0;
     }
 
-    .actions button {
-      font-size: 14px;
-      padding: 8px 10px;
+    .item {
+      padding: 12px 0;
+      border-bottom: 1px solid #374151;
+      overflow-wrap: anywhere;
     }
 
-    #editPanel {
-      background: #111827;
-      border: 1px solid #4b5563;
-      border-radius: 8px;
-      padding: 14px;
-      margin-top: 16px;
+    .item:last-child { border-bottom: 0; }
+
+    #queue, #networks {
+      list-style: none;
+      padding: 0;
     }
+
+    #status { font-weight: bold; }
 
     [hidden] { display: none !important; }
   </style>
 </head>
 
 <body>
-  <main>
-    <h1>HIDLab</h1>
-    <p>Arduino Nano ESP32 — Local Control Interface</p>
+<main>
+  <h1>HIDLab</h1>
+  <p>USB HID Research Platform</p>
 
-    <section class="panel">
-      <h2>Device Status</h2>
-      <div id="status">Connecting...</div>
-      <p id="message" aria-live="polite"></p>
-    </section>
+  <section>
+    <h2>Device Status</h2>
+    <div id="status">Connecting...</div>
+    <p id="networkStatus"></p>
+    <p id="sessionStatus" class="muted"></p>
+    <p id="message" aria-live="polite"></p>
+  </section>
 
-    <section class="panel">
-      <h2>Text Queue</h2>
+  <section>
+    <h2>Text Queue</h2>
 
-      <textarea
-        id="textInput"
-        maxlength="12000"
-        placeholder="Enter a passage..."
-        aria-label="New passage"
-      ></textarea>
+    <textarea
+      id="textInput"
+      maxlength="12000"
+      placeholder="Enter an ASCII passage..."
+    ></textarea>
 
-      <button id="add" class="primary full-width"
-              onclick="sendAction('add')">
-        Add to Queue
-      </button>
+    <button class="primary full" onclick="action('add')">
+      Add to Queue
+    </button>
 
-      <h3>Queued Passages</h3>
-      <ul id="queue"></ul>
-      <p id="emptyQueue">No passages waiting.</p>
+    <h3>Waiting Passages</h3>
+    <ul id="queue"></ul>
 
-      <div id="editPanel" hidden>
-        <h3>Edit Passage</h3>
-
-        <textarea id="editInput"
-                  maxlength="12000"
-                  aria-label="Edit passage"></textarea>
-
-        <div class="controls">
-          <button class="primary" onclick="saveEdit()">
-            Save
-          </button>
-          <button onclick="cancelEdit()">
-            Cancel
-          </button>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel">
-      <h2>Playback Controls</h2>
+    <div id="editor" hidden>
+      <h3>Edit Passage</h3>
+      <textarea id="editInput" maxlength="12000"></textarea>
 
       <div class="controls">
-        <button id="start" class="primary"
-                onclick="sendAction('start')">Start</button>
-        <button id="pause"
-                onclick="sendAction('pause')">Pause</button>
-        <button id="resume"
-                onclick="sendAction('resume')">Resume</button>
-        <button id="stop"
-                onclick="sendAction('stop')">Stop</button>
+        <button class="primary" onclick="saveEdit()">Save</button>
+        <button onclick="cancelEdit()">Cancel</button>
       </div>
-    </section>
-  </main>
+    </div>
+  </section>
 
-  <script>
-    let passages = [];
-    let editingIndex = null;
-    let requestPending = false;
+  <section>
+    <h2>Playback Controls</h2>
 
-    /**
-     * Send a queue or playback command to the device.
-     * @returns {Promise<boolean>} Whether the request succeeded.
-     */
-    async function sendAction(action, options = {}) {
-      if (requestPending) return false;
+    <div class="controls">
+      <button id="start" class="primary"
+              onclick="action('start')">Start</button>
+      <button id="pause"
+              onclick="action('pause')">Pause</button>
+      <button id="resume"
+              onclick="action('resume')">Resume</button>
+      <button id="stop"
+              onclick="action('stop')">Stop</button>
+    </div>
+  </section>
 
-      requestPending = true;
+  <section>
+    <h2>Wi-Fi Networks</h2>
+    <p>Saved network passwords are not displayed.</p>
 
-      const input = document.getElementById("textInput");
-      const message = document.getElementById("message");
+    <ul id="networks"></ul>
 
-      try {
-        const response = await fetch("/api/action", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action,
-            text: action === "add" ? input.value : (options.text ?? ""),
-            index: options.index ?? null,
-            direction: options.direction ?? null
-          })
-        });
+    <h3>Add or Update Network</h3>
 
-        const result = await response.json();
-        message.textContent =
-          result.message || result.error || "Unknown response.";
+    <input id="ssid" maxlength="32"
+           placeholder="Wi-Fi network name">
 
-        if (response.ok) {
-          if (action === "add") input.value = "";
+    <input id="password" type="password"
+           maxlength="63"
+           placeholder="Wi-Fi password">
 
-          if (["remove", "move", "start", "stop"].includes(action)) {
-            cancelEdit();
-          }
-        }
+    <button class="primary full" onclick="saveNetwork()">
+      Save Network
+    </button>
 
-        await refresh();
-        return response.ok;
+    <p class="muted">
+      Saving a network may disconnect this webpage temporarily.
+    </p>
+  </section>
+</main>
 
-      } catch (error) {
-        message.textContent = "Cannot reach HIDLab.";
-        return false;
+<script>
+  const tokenKey = "hidlab-session-token";
 
-      } finally {
-        requestPending = false;
+  let token = localStorage.getItem(tokenKey);
+
+  if (!token) {
+    const bytes = new Uint8Array(24);
+    crypto.getRandomValues(bytes);
+
+    token = Array.from(bytes, byte =>
+      byte.toString(16).padStart(2, "0")
+    ).join("");
+
+    localStorage.setItem(tokenKey, token);
+  }
+
+  let controller = false;
+  let passages = [];
+  let editingIndex = null;
+  let busy = false;
+
+  const element = id => document.getElementById(id);
+
+  /**
+   * Acquire or renew the browser's controller session.
+   */
+  async function claimSession() {
+    try {
+      const response = await fetch("/api/session", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({token})
+      });
+
+      controller = response.ok;
+
+      element("sessionStatus").textContent = controller
+        ? "Controller connected"
+        : "Another device is controlling HIDLab";
+
+    } catch {
+      controller = false;
+      element("sessionStatus").textContent =
+        "Controller unavailable";
+    }
+  }
+
+  /**
+   * Submit an authenticated JSON command to an API endpoint.
+   */
+  async function post(path, payload) {
+    if (!controller || busy) {
+      return false;
+    }
+
+    busy = true;
+
+    try {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-HIDLab-Session": token
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const result = await response.json();
+
+      element("message").textContent =
+        result.message || result.error || "";
+
+      if (response.status === 423) {
+        controller = false;
+      }
+
+      return response.ok;
+
+    } catch {
+      element("message").textContent = "Connection lost.";
+      return false;
+
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
+   * Execute a passage queue or playback command.
+   */
+  async function action(name, options = {}) {
+    const success = await post("/api/action", {
+      action: name,
+      text: name === "add"
+        ? element("textInput").value
+        : (options.text ?? ""),
+      index: options.index ?? null,
+      direction: options.direction ?? null
+    });
+
+    if (success) {
+      if (name === "add") {
+        element("textInput").value = "";
+      }
+
+      if (["remove", "move", "start", "stop"].includes(name)) {
+        cancelEdit();
       }
     }
 
-    /**
-     * Open the editor for a waiting passage.
-     */
-    function beginEdit(index) {
-      if (index < 0 || index >= passages.length) return;
+    await refresh();
+  }
 
-      editingIndex = index;
-      document.getElementById("editInput").value = passages[index];
-      document.getElementById("editPanel").hidden = false;
+  /** Open the passage editor without changing queued text. */
+  function beginEdit(index) {
+    editingIndex = index;
+    element("editInput").value = passages[index];
+    element("editor").hidden = false;
+    element("editInput").focus();
+  }
+
+  /** Save the passage currently being edited. */
+  async function saveEdit() {
+    if (editingIndex === null) return;
+
+    const success = await post("/api/action", {
+      action: "edit",
+      index: editingIndex,
+      text: element("editInput").value
+    });
+
+    if (success) {
+      cancelEdit();
     }
 
-    /**
-     * Save changes to the selected passage.
-     */
-    async function saveEdit() {
-      if (editingIndex === null) return;
+    await refresh();
+  }
 
-      const saved = await sendAction("edit", {
-        index: editingIndex,
-        text: document.getElementById("editInput").value
-      });
+  /** Dismiss the editor without modifying the queue. */
+  function cancelEdit() {
+    editingIndex = null;
+    element("editInput").value = "";
+    element("editor").hidden = true;
+  }
 
-      if (saved) cancelEdit();
+  /** Build an action button for a queue or network item. */
+  function makeButton(label, handler, disabled = false, css = "") {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.type = "button";
+    button.disabled = disabled || !controller;
+    button.className = css;
+    button.addEventListener("click", handler);
+    return button;
+  }
+
+  /** Render the waiting queue and its management controls. */
+  function renderQueue() {
+    const list = element("queue");
+    list.replaceChildren();
+
+    passages.forEach((text, index) => {
+      const item = document.createElement("li");
+      item.className = "item";
+
+      const preview = document.createElement("div");
+      preview.textContent =
+        `Passage ${index + 1}: ${text.slice(0, 100)}` +
+        (text.length > 100 ? "..." : "");
+
+      const buttons = document.createElement("div");
+      buttons.className = "actions";
+
+      buttons.append(
+        makeButton("Edit", () => beginEdit(index)),
+        makeButton(
+          "Up",
+          () => action("move", {index, direction: "up"}),
+          index === 0
+        ),
+        makeButton(
+          "Down",
+          () => action("move", {index, direction: "down"}),
+          index === passages.length - 1
+        ),
+        makeButton(
+          "Remove",
+          () => action("remove", {index}),
+          false,
+          "danger"
+        )
+      );
+
+      item.append(preview, buttons);
+      list.appendChild(item);
+    });
+
+    if (editingIndex !== null &&
+        editingIndex >= passages.length) {
+      cancelEdit();
     }
+  }
 
-    /**
-     * Dismiss the passage editor without saving.
-     */
-    function cancelEdit() {
-      editingIndex = null;
-      document.getElementById("editPanel").hidden = true;
-      document.getElementById("editInput").value = "";
-    }
+  /** Display saved network names and removal controls. */
+  async function refreshNetworks() {
+    try {
+      const response = await fetch("/api/networks");
+      const data = await response.json();
 
-    /**
-     * Create a button with its associated action.
-     */
-    function makeButton(label, callback, disabled = false, css = "") {
-      const button = document.createElement("button");
-
-      button.textContent = label;
-      button.type = "button";
-      button.disabled = disabled;
-      button.className = css;
-      button.addEventListener("click", callback);
-
-      return button;
-    }
-
-    /**
-     * Render the waiting queue and its management controls.
-     */
-    function renderQueue() {
-      const list = document.getElementById("queue");
+      const list = element("networks");
       list.replaceChildren();
 
-      document.getElementById("emptyQueue").hidden =
-        passages.length > 0;
-
-      passages.forEach((text, index) => {
+      data.networks.forEach((ssid, index) => {
         const item = document.createElement("li");
-        item.className = "queue-item";
+        item.className = "item";
 
-        const preview = document.createElement("div");
-        preview.className = "preview";
+        const label = document.createElement("span");
+        label.textContent = ssid + " ";
 
-        preview.textContent =
-          `Passage ${index + 1}: ${text.slice(0, 100)}` +
-          (text.length > 100 ? "..." : "");
-
-        const actions = document.createElement("div");
-        actions.className = "actions";
-
-        actions.appendChild(
-          makeButton("Edit", () => beginEdit(index))
+        const button = makeButton(
+          "Remove",
+          () => removeNetwork(index),
+          false,
+          "danger"
         );
 
-        actions.appendChild(
-          makeButton(
-            "Up",
-            () => sendAction("move", { index, direction: "up" }),
-            index === 0
-          )
-        );
-
-        actions.appendChild(
-          makeButton(
-            "Down",
-            () => sendAction("move", { index, direction: "down" }),
-            index === passages.length - 1
-          )
-        );
-
-        actions.appendChild(
-          makeButton(
-            "Remove",
-            () => sendAction("remove", { index }),
-            false,
-            "danger"
-          )
-        );
-
-        item.append(preview, actions);
+        item.append(label, button);
         list.appendChild(item);
       });
+    } catch {
+      element("message").textContent =
+        "Could not load saved networks.";
+    }
+  }
+
+  /** Save a Wi-Fi profile on the device. */
+  async function saveNetwork() {
+    const success = await post("/api/networks/action", {
+      action: "add",
+      ssid: element("ssid").value,
+      password: element("password").value
+    });
+
+    if (success) {
+      element("ssid").value = "";
+      element("password").value = "";
     }
 
-    /**
-     * Synchronize the interface with the device state.
-     */
-    async function refresh() {
-      try {
-        const response = await fetch("/api/status", {
-          cache: "no-store"
-        });
+    await refreshNetworks();
+  }
 
-        if (!response.ok) throw new Error("Status request failed");
+  /** Delete a Wi-Fi profile by its displayed index. */
+  async function removeNetwork(index) {
+    await post("/api/networks/action", {
+      action: "remove",
+      index
+    });
 
-        const data = await response.json();
+    await refreshNetworks();
+  }
 
-        document.getElementById("status").textContent =
-          data.status.toUpperCase();
+  /** Refresh playback, queue, and connectivity indicators. */
+  async function refresh() {
+    try {
+      const response = await fetch("/api/status", {
+        cache: "no-store"
+      });
 
-        passages = data.passages;
-        renderQueue();
+      if (!response.ok) {
+        throw new Error("Status unavailable");
+      }
 
-        if (editingIndex !== null &&
-            editingIndex >= passages.length) {
-          cancelEdit();
-        }
+      const data = await response.json();
 
-        document.getElementById("start").disabled =
-          data.status !== "idle" || data.queued === 0;
+      element("status").textContent = data.status.toUpperCase();
 
-        document.getElementById("pause").disabled =
-          data.status !== "typing";
+      element("networkStatus").textContent =
+        data.setup_mode
+          ? `Setup network: ${data.ip}`
+          : `Wi-Fi: ${data.network || "Connecting"} (${data.ip})`;
 
-        document.getElementById("resume").disabled =
-          data.status !== "paused";
+      passages = data.passages;
+      renderQueue();
 
-        document.getElementById("stop").disabled =
-          data.status === "idle";
+      element("start").disabled =
+        !controller || data.status !== "idle" || data.queued === 0;
 
-      } catch (error) {
-        document.getElementById("status").textContent =
-          "DISCONNECTED";
+      element("pause").disabled =
+        !controller || data.status !== "typing";
 
-        for (const id of ["start", "pause", "resume", "stop"]) {
-          document.getElementById(id).disabled = true;
-        }
+      element("resume").disabled =
+        !controller || data.status !== "paused";
+
+      element("stop").disabled =
+        !controller || data.status === "idle";
+
+    } catch {
+      element("status").textContent = "DISCONNECTED";
+
+      for (const id of ["start", "pause", "resume", "stop"]) {
+        element(id).disabled = true;
       }
     }
+  }
 
-    refresh();
+  /** Initialize and periodically synchronize the interface. */
+  async function initialize() {
+    await claimSession();
+    await refresh();
+    await refreshNetworks();
+
     setInterval(refresh, 1000);
-  </script>
+    setInterval(claimSession, 10000);
+    setInterval(refreshNetworks, 10000);
+  }
+
+  initialize();
+</script>
 </body>
 </html>
 )hidlab";
