@@ -3,32 +3,36 @@
  * HIDLab firmware
  * Target: Arduino Nano ESP32
  *
- * Provides Wi-Fi connectivity and a local HTTP API for
- * managing passages and playback state.
+ * Hosts a Wi-Fi control interface and sends queued ASCII text
+ * through the native USB HID keyboard interface.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <USB.h>
+#include <USBHIDKeyboard.h>
 
 #include "wifi_credentials.h"
 #include "PassageQueue.h"
 #include "WebPage.h"
 
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
+constexpr unsigned long KEY_INTERVAL_MS = 150;
 constexpr size_t MAX_REQUEST_BYTES = 32000;
 
 WebServer server(80);
 PassageQueue passageQueue;
+USBHIDKeyboard Keyboard;
 
 unsigned long lastWifiAttempt = 0;
+unsigned long lastKeyTime = 0;
 bool wasConnected = false;
 
 
 /**
- * Check whether text contains only supported ASCII characters.
- * Printable ASCII, tabs, and line endings are permitted.
+ * Accept printable ASCII, tabs, and line endings.
  */
 bool isSupportedText(const String& text) {
     for (size_t i = 0; i < text.length(); ++i) {
@@ -52,7 +56,7 @@ bool isSupportedText(const String& text) {
 
 
 /**
- * Serialize a JSON document and send it to the HTTP client.
+ * Serialize and send a JSON response.
  */
 void sendJson(int statusCode, const JsonDocument& document) {
     String response;
@@ -67,8 +71,7 @@ void sendJson(int statusCode, const JsonDocument& document) {
 
 
 /**
- * Return an API error using the same response structure
- * as the Python simulator.
+ * Return an API error response.
  */
 void sendError(int statusCode, const char* message) {
     JsonDocument response;
@@ -80,7 +83,7 @@ void sendError(int statusCode, const char* message) {
 
 
 /**
- * Serve the browser-based HIDLab control interface.
+ * Serve the HIDLab control interface.
  */
 void handleRoot() {
     server.send_P(
@@ -92,9 +95,7 @@ void handleRoot() {
 
 
 /**
- * Return the current playback state and waiting passages.
- *
- * GET /api/status
+ * Return playback status and waiting passages.
  */
 void handleStatus() {
     JsonDocument response;
@@ -113,9 +114,7 @@ void handleStatus() {
 
 
 /**
- * Execute a queue or playback command received from the browser.
- *
- * POST /api/action
+ * Process queue and playback commands from the web interface.
  */
 void handleAction() {
     if (!server.hasArg("plain")) {
@@ -160,9 +159,11 @@ void handleAction() {
 
         if (strcmp(action, "add") == 0) {
             success = passageQueue.add(text);
+
             message = success
                 ? "Passage added."
                 : "Invalid passage or queue is full.";
+
         } else {
             if (!request["index"].is<int>()) {
                 sendError(400, "Invalid queue position.");
@@ -232,6 +233,11 @@ void handleAction() {
         success = passageQueue.start();
         message = success ? "Started." : "Cannot start.";
 
+        if (success) {
+            // Schedule the first character after Start.
+            lastKeyTime = millis();
+        }
+
     } else if (strcmp(action, "pause") == 0) {
 
         success = passageQueue.pause();
@@ -241,6 +247,10 @@ void handleAction() {
 
         success = passageQueue.resume();
         message = success ? "Resumed." : "Cannot resume.";
+
+        if (success) {
+            lastKeyTime = millis();
+        }
 
     } else if (strcmp(action, "stop") == 0) {
 
@@ -259,7 +269,7 @@ void handleAction() {
 
 
 /**
- * Register the HTTP routes and start listening for requests.
+ * Register the HTTP routes.
  */
 void configureServer() {
     server.on("/", HTTP_GET, handleRoot);
@@ -275,7 +285,7 @@ void configureServer() {
 
 
 /**
- * Begin connecting to the configured Wi-Fi network.
+ * Initiate a connection to the configured Wi-Fi network.
  */
 void connectWifi() {
     Serial.println("Connecting to Wi-Fi...");
@@ -286,7 +296,7 @@ void connectWifi() {
 
 
 /**
- * Monitor Wi-Fi state and periodically retry disconnections.
+ * Monitor Wi-Fi connectivity and retry when disconnected.
  */
 void maintainWifi() {
     bool connected = WiFi.status() == WL_CONNECTED;
@@ -311,10 +321,48 @@ void maintainWifi() {
 
 
 /**
- * Initialize serial diagnostics, Wi-Fi, and HTTP services.
+ * Process one queued character when playback is active.
+ *
+ * HTTP processing remains responsive because this function
+ * does not wait between characters.
+ */
+void processKeyboard() {
+    if (passageQueue.state() != PassageQueue::State::Typing) {
+        return;
+    }
+
+    unsigned long now = millis();
+
+    if (now - lastKeyTime < KEY_INTERVAL_MS) {
+        return;
+    }
+
+    lastKeyTime = now;
+
+    char character;
+
+    if (!passageQueue.nextCharacter(character)) {
+        return;
+    }
+
+    // Normalize line endings for USB keyboard output.
+    // Windows CRLF passages require separate handling later.
+    if (character == '\r') {
+        return;
+    }
+
+    Keyboard.write(static_cast<uint8_t>(character));
+}
+
+
+/**
+ * Initialize USB HID, networking, and the HTTP server.
  */
 void setup() {
     Serial.begin(115200);
+
+    Keyboard.begin();
+    USB.begin();
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
@@ -327,7 +375,7 @@ void setup() {
 
 
 /**
- * Maintain network connectivity and process HTTP requests.
+ * Service Wi-Fi, HTTP requests, and keyboard output.
  */
 void loop() {
     maintainWifi();
@@ -336,5 +384,7 @@ void loop() {
         server.handleClient();
     }
 
-    delay(10);
+    processKeyboard();
+
+    delay(1);
 }
