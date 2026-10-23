@@ -1,0 +1,28 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Arduino and embedded build artifacts
+build/
+.pio/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+secrets.h
+wifi_credentials.h
+
+# Operating system files
+.DS_Store
+Thumbs.db
