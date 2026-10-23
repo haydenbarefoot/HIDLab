@@ -1,0 +1,547 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HIDLab</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #111827;
+      color: #f9fafb;
+      font-family: system-ui, sans-serif;
+    }
+
+    main {
+      max-width: 650px;
+      margin: 40px auto;
+      padding: 20px;
+    }
+
+    h1 {
+      margin-bottom: 4px;
+    }
+
+    p {
+      color: #9ca3af;
+    }
+
+    .panel {
+      background: #1f2937;
+      padding: 22px;
+      border-radius: 12px;
+      margin-top: 20px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 160px;
+      padding: 14px;
+      background: #111827;
+      color: white;
+      border: 1px solid #4b5563;
+      border-radius: 8px;
+      font: inherit;
+      resize: vertical;
+    }
+
+    button {
+      padding: 11px 13px;
+      border: 0;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #374151;
+      color: white;
+      font: inherit;
+    }
+
+    button:hover:not(:disabled) {
+      background: #4b5563;
+    }
+
+    button:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
+
+    .primary {
+      background: #2563eb;
+    }
+
+    .primary:hover:not(:disabled) {
+      background: #1d4ed8;
+    }
+
+    .danger {
+      background: #991b1b;
+    }
+
+    .danger:hover:not(:disabled) {
+      background: #b91c1c;
+    }
+
+    .full-width {
+      width: 100%;
+      margin-top: 12px;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-top: 15px;
+    }
+
+    #status {
+      font-weight: bold;
+    }
+
+    #message {
+      min-height: 20px;
+      overflow-wrap: anywhere;
+    }
+
+    #queue {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .queue-item {
+      padding: 14px 0;
+      border-bottom: 1px solid #374151;
+    }
+
+    .queue-item:last-child {
+      border-bottom: 0;
+    }
+
+    .passage-preview {
+      margin-bottom: 12px;
+      overflow-wrap: anywhere;
+      line-height: 1.5;
+    }
+
+    .queue-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .queue-actions button {
+      font-size: 14px;
+      padding: 8px 11px;
+    }
+
+    #editPanel {
+      margin-top: 20px;
+      padding: 16px;
+      background: #111827;
+      border: 1px solid #4b5563;
+      border-radius: 8px;
+    }
+
+    #editPanel[hidden] {
+      display: none;
+    }
+
+    #editPanel h3 {
+      margin-top: 0;
+    }
+
+    .edit-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .edit-actions button {
+      flex: 1;
+    }
+
+    .hint {
+      font-size: 13px;
+    }
+
+    @media (max-width: 420px) {
+      main {
+        margin: 12px auto;
+        padding: 12px;
+      }
+
+      .panel {
+        padding: 16px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <header>
+      <h1>HIDLab</h1>
+      <p>USB HID Research Platform — Local Simulator</p>
+    </header>
+
+    <section class="panel">
+      <h2>Device Status</h2>
+      <div id="status" role="status">Connecting...</div>
+      <p id="message" aria-live="polite"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Text Queue</h2>
+
+      <textarea
+        id="textInput"
+        aria-label="New passage text"
+        maxlength="12000"
+        placeholder="Enter a passage to queue..."
+      ></textarea>
+
+      <button
+        class="primary full-width"
+        onclick="sendAction('add')"
+      >
+        Add to Queue
+      </button>
+
+      <h3>Queued Passages</h3>
+      <ol id="queue"></ol>
+
+      <p id="emptyQueue" class="hint">
+        No passages waiting.
+      </p>
+
+      <div id="editPanel" hidden>
+        <h3 id="editTitle">Edit Passage</h3>
+
+        <textarea
+          id="editInput"
+          aria-label="Edit passage text"
+          maxlength="12000"
+        ></textarea>
+
+        <div class="edit-actions">
+          <button
+            class="primary"
+            onclick="saveEdit()"
+          >
+            Save Changes
+          </button>
+
+          <button onclick="cancelEdit()">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Keyboard Controls</h2>
+
+      <div class="controls">
+        <button
+          id="start"
+          class="primary"
+          onclick="sendAction('start')"
+        >
+          Start
+        </button>
+
+        <button
+          id="pause"
+          onclick="sendAction('pause')"
+        >
+          Pause
+        </button>
+
+        <button
+          id="resume"
+          onclick="sendAction('resume')"
+        >
+          Resume
+        </button>
+
+        <button
+          id="stop"
+          onclick="sendAction('stop')"
+        >
+          Stop
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let passages = [];
+    let editingIndex = null;
+    let requestPending = false;
+
+    /**
+     * Submit a command to the simulator API.
+     *
+     * @param {string} action - Command to execute.
+     * @param {Object} options - Optional command parameters.
+     * @returns {Promise<boolean>} Whether the command succeeded.
+     */
+    async function sendAction(action, options = {}) {
+      if (requestPending) {
+        return false;
+      }
+
+      requestPending = true;
+
+      const input = document.getElementById("textInput");
+      const message = document.getElementById("message");
+
+      try {
+        const response = await fetch("/api/action", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            action,
+            text: action === "add" ? input.value : (options.text ?? ""),
+            index: options.index ?? null,
+            direction: options.direction ?? null
+          })
+        });
+
+        const result = await response.json();
+
+        message.textContent =
+          result.message || result.error || "Unknown response.";
+
+        if (response.ok) {
+          if (action === "add") {
+            input.value = "";
+          }
+
+          // Queue positions can change after these commands.
+          if (["remove", "move", "start", "stop"].includes(action)) {
+            cancelEdit();
+          }
+        }
+
+        await refresh();
+        return response.ok;
+
+      } catch (error) {
+        message.textContent = "Cannot reach the simulator.";
+        return false;
+
+      } finally {
+        requestPending = false;
+      }
+    }
+
+    /**
+     * Open the editor for a waiting passage.
+     *
+     * @param {number} index - Passage position in the queue.
+     */
+    function beginEdit(index) {
+      if (index < 0 || index >= passages.length) {
+        return;
+      }
+
+      editingIndex = index;
+
+      document.getElementById("editTitle").textContent =
+        `Edit Passage ${index + 1}`;
+
+      document.getElementById("editInput").value =
+        passages[index];
+
+      document.getElementById("editPanel").hidden = false;
+      document.getElementById("editInput").focus();
+    }
+
+    /**
+     * Save the currently edited passage through the simulator API.
+     */
+    async function saveEdit() {
+      if (editingIndex === null) {
+        return;
+      }
+
+      const updatedText =
+        document.getElementById("editInput").value;
+
+      const saved = await sendAction("edit", {
+        index: editingIndex,
+        text: updatedText
+      });
+
+      if (saved) {
+        cancelEdit();
+      }
+    }
+
+    /**
+     * Close the editor without modifying the queued passage.
+     */
+    function cancelEdit() {
+      editingIndex = null;
+      document.getElementById("editPanel").hidden = true;
+      document.getElementById("editInput").value = "";
+    }
+
+    /**
+     * Create an action button for a waiting passage.
+     *
+     * @param {string} label - Button text.
+     * @param {Function} handler - Function called when clicked.
+     * @param {boolean} disabled - Whether the action is available.
+     * @param {string} className - Optional CSS class.
+     * @returns {HTMLButtonElement} The configured button.
+     */
+    function createButton(
+      label,
+      handler,
+      disabled = false,
+      className = ""
+    ) {
+      const button = document.createElement("button");
+
+      button.type = "button";
+      button.textContent = label;
+      button.disabled = disabled;
+      button.className = className;
+      button.addEventListener("click", handler);
+
+      return button;
+    }
+
+    /**
+     * Render waiting passages and their management controls.
+     */
+    function renderQueue() {
+      const list = document.getElementById("queue");
+      const emptyMessage = document.getElementById("emptyQueue");
+
+      list.replaceChildren();
+      emptyMessage.hidden = passages.length > 0;
+
+      passages.forEach((passage, index) => {
+        const item = document.createElement("li");
+        item.className = "queue-item";
+
+        const preview = document.createElement("div");
+        preview.className = "passage-preview";
+
+        const excerpt = passage.slice(0, 120);
+        const suffix = passage.length > 120 ? "..." : "";
+
+        preview.textContent =
+          `Passage ${index + 1}: ${excerpt}${suffix}`;
+
+        const actions = document.createElement("div");
+        actions.className = "queue-actions";
+
+        actions.appendChild(
+          createButton("Edit", () => beginEdit(index))
+        );
+
+        actions.appendChild(
+          createButton(
+            "Move Up",
+            () => sendAction("move", {
+              index,
+              direction: "up"
+            }),
+            index === 0
+          )
+        );
+
+        actions.appendChild(
+          createButton(
+            "Move Down",
+            () => sendAction("move", {
+              index,
+              direction: "down"
+            }),
+            index === passages.length - 1
+          )
+        );
+
+        actions.appendChild(
+          createButton(
+            "Remove",
+            () => sendAction("remove", { index }),
+            false,
+            "danger"
+          )
+        );
+
+        item.appendChild(preview);
+        item.appendChild(actions);
+        list.appendChild(item);
+      });
+    }
+
+    /**
+     * Synchronize queue and playback controls with the server state.
+     */
+    async function refresh() {
+      try {
+        const response = await fetch("/api/status", {
+          cache: "no-store"
+        });
+
+        if (!response.ok) {
+          throw new Error("Server error");
+        }
+
+        const data = await response.json();
+
+        document.getElementById("status").textContent =
+          data.status.toUpperCase();
+
+        passages = data.passages;
+        renderQueue();
+
+        if (
+          editingIndex !== null &&
+          editingIndex >= passages.length
+        ) {
+          cancelEdit();
+        }
+
+        document.getElementById("start").disabled =
+          data.status !== "idle" || data.queued === 0;
+
+        document.getElementById("pause").disabled =
+          data.status !== "typing";
+
+        document.getElementById("resume").disabled =
+          data.status !== "paused";
+
+        document.getElementById("stop").disabled =
+          data.status === "idle";
+
+      } catch (error) {
+        document.getElementById("status").textContent =
+          "DISCONNECTED";
+
+        for (const id of ["start", "pause", "resume", "stop"]) {
+          document.getElementById(id).disabled = true;
+        }
+      }
+    }
+
+    refresh();
+
+    // Keep the browser synchronized with the simulator.
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>
