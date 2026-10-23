@@ -8,12 +8,15 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "PassageQueue.h"
 
 #include "wifi_credentials.h"
 
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 15000;
 
 WebServer server(80);
+PassageQueue passageQueue;
+
 
 unsigned long lastWifiAttempt = 0;
 bool wasConnected = false;
@@ -99,19 +102,17 @@ const char INDEX_HTML[] = R"rawliteral(
 
 
 /**
- * Return the initial device status as JSON.
- *
- * Future versions will use the same endpoint to expose
- * the keyboard state and passage queue.
+ * Return the current queue and playback status.
  */
 void handleStatus() {
-  server.send(
-    200,
-    "application/json",
-    "{\"status\":\"idle\",\"queued\":0,\"passages\":[]}"
-  );
-}
+    String response = "{\"status\":\"";
+    response += passageQueue.statusName();
+    response += "\",\"queued\":";
+    response += passageQueue.waitingCount();
+    response += ",\"passages\":[]}";
 
+    server.send(200, "application/json", response);
+}
 
 /**
  * Serve the temporary firmware validation webpage.
