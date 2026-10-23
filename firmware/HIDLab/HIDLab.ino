@@ -1,10 +1,5 @@
 
-/**
- * HIDLab firmware
- * Target: Arduino Nano ESP32
- *
- * Wi-Fi-controlled USB HID keyboard research platform.
- */
+/** HIDLab: Wi-Fi-controlled USB HID keyboard for Arduino Nano ESP32. */
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,79 +13,87 @@
 #include "WebPage.h"
 
 constexpr unsigned long KEY_INTERVAL_MS = 150;
-constexpr unsigned long SESSION_TIMEOUT_MS = 30000;
+constexpr unsigned long SESSION_LEASE_MS = 30000;
 constexpr size_t MAX_REQUEST_BYTES = 32000;
 
 WebServer server(80);
-PassageQueue passageQueue;
-NetworkManager networkManager;
 USBHIDKeyboard Keyboard;
+PassageQueue queue;
+NetworkManager networks;
 
-unsigned long lastKeyTime = 0;
-unsigned long lastSessionActivity = 0;
+volatile bool usbReady = false;
+volatile bool usbLost = false;
 
-String activeSession;
+bool pausedByUsb = false;
+unsigned long lastKeyAt = 0;
+
+String controllerToken;
+unsigned long lastControllerAt = 0;
+uint32_t networkGeneration = 0;
 
 
-/** Check that a passage contains only supported ASCII text. */
-bool isSupportedText(const String& text) {
-    for (size_t i = 0; i < text.length(); ++i) {
-        const unsigned char ch = text[i];
+/** Track USB enumeration, disconnection, suspend, and resume events. */
+static void usbEvent(
+    void*,
+    esp_event_base_t base,
+    int32_t event,
+    void*
+) {
+    if (base != ARDUINO_USB_EVENTS) return;
 
-        if (ch >= 32 && ch <= 126) {
-            continue;
-        }
+    if (event == ARDUINO_USB_STARTED_EVENT ||
+        event == ARDUINO_USB_RESUME_EVENT) {
 
-        if (ch == '\n' || ch == '\r' || ch == '\t') {
-            continue;
-        }
+        usbReady = true;
 
-        return false;
+    } else if (event == ARDUINO_USB_STOPPED_EVENT ||
+               event == ARDUINO_USB_SUSPEND_EVENT) {
+
+        usbReady = false;
+        usbLost = true;
     }
-
-    return true;
 }
 
 
-/** Send a JSON document as an HTTP response. */
-void sendJson(int statusCode, const JsonDocument& document) {
-    String body;
-    serializeJson(document, body);
+/** Serialize a JSON document to an HTTP response. */
+void sendJson(int code, const JsonDocument& data) {
+    String result;
+    serializeJson(data, result);
 
+    server.sendHeader("Cache-Control", "no-store");
     server.send(
-        statusCode,
+        code,
         "application/json; charset=utf-8",
-        body
+        result
     );
 }
 
 
-/** Send a consistent JSON error response. */
-void sendError(int statusCode, const char* message) {
-    JsonDocument response;
-    response["ok"] = false;
-    response["error"] = message;
-    sendJson(statusCode, response);
+void sendError(int code, const char* message) {
+    JsonDocument data;
+    data["ok"] = false;
+    data["error"] = message;
+
+    sendJson(code, data);
 }
 
 
-/** Parse the incoming JSON request body. */
-bool readRequest(JsonDocument& request) {
+/** Validate and parse an incoming JSON request. */
+bool readJson(JsonDocument& data) {
     if (!server.hasArg("plain")) {
         sendError(400, "Missing request body.");
         return false;
     }
 
-    const String body = server.arg("plain");
+    String body = server.arg("plain");
 
     if (body.isEmpty() || body.length() > MAX_REQUEST_BYTES) {
         sendError(413, "Invalid request size.");
         return false;
     }
 
-    if (deserializeJson(request, body) ||
-        !request.is<JsonObject>()) {
-        sendError(400, "Invalid JSON request.");
+    if (deserializeJson(data, body) || !data.is<JsonObject>()) {
+        sendError(400, "Invalid JSON.");
         return false;
     }
 
@@ -98,64 +101,79 @@ bool readRequest(JsonDocument& request) {
 }
 
 
-/**
- * Check whether the browser holds the active control session.
- *
- * Sessions prevent simultaneous commands from different browsers.
- * They are not authentication against other devices on the LAN.
- */
-bool authorizeSession() {
+/** Require a valid, unexpired browser control session. */
+bool authorized() {
     const String token = server.header("X-HIDLab-Session");
 
-    if (token.isEmpty() || token != activeSession) {
-        sendError(423, "Another controller owns this session.");
+    const bool expired =
+        millis() - lastControllerAt >= SESSION_LEASE_MS;
+
+    if (controllerToken.isEmpty() ||
+        expired ||
+        token != controllerToken) {
+
+        sendError(
+            423,
+            "Controller session unavailable. Reconnect from the control page."
+        );
+
         return false;
     }
 
-    lastSessionActivity = millis();
+    lastControllerAt = millis();
     return true;
 }
 
 
-/**
- * Acquire or renew the single-controller session.
- *
- * An inactive session expires after 30 seconds.
- */
+/** Acquire or renew the single browser-controller session. */
 void handleSession() {
     JsonDocument request;
 
-    if (!readRequest(request)) {
+    if (!readJson(request)) return;
+
+    if (!request["token"].is<const char*>()) {
+        sendError(400, "Missing session token.");
         return;
     }
 
-    const String token = request["token"] | "";
+    String token = request["token"].as<String>();
 
-    if (token.length() < 16 || token.length() > 128) {
+    if (token.length() < 32 || token.length() > 128) {
         sendError(400, "Invalid session token.");
         return;
     }
 
-    const bool expired =
-        millis() - lastSessionActivity >= SESSION_TIMEOUT_MS;
+    if (!controllerToken.isEmpty() &&
+        token != controllerToken &&
+        millis() - lastControllerAt < SESSION_LEASE_MS) {
 
-    if (!activeSession.isEmpty() &&
-        activeSession != token &&
-        !expired) {
-        sendError(423, "Another controller is connected.");
+        sendError(423, "Another device has control.");
         return;
     }
 
-    activeSession = token;
-    lastSessionActivity = millis();
+    controllerToken = token;
+    lastControllerAt = millis();
 
     JsonDocument response;
     response["ok"] = true;
+
     sendJson(200, response);
 }
 
 
-/** Serve the control webpage from firmware flash. */
+/** Release control without stopping the current passage. */
+void handleRelease() {
+    if (!authorized()) return;
+
+    controllerToken = "";
+
+    JsonDocument response;
+    response["ok"] = true;
+
+    sendJson(200, response);
+}
+
+
 void handleRoot() {
     server.send_P(
         200,
@@ -165,48 +183,49 @@ void handleRoot() {
 }
 
 
-/** Return the current queue and playback state. */
+/** Return queue, USB, and network status to the controller. */
 void handleStatus() {
+    if (!authorized()) return;
+
     JsonDocument response;
 
-    response["status"] = passageQueue.statusName();
-    response["queued"] = passageQueue.waitingCount();
-    response["network"] = networkManager.currentSSID();
-    response["ip"] = networkManager.address();
-    response["setup_mode"] = networkManager.setupMode();
+    response["status"] = queue.statusName();
+    response["queued"] = queue.waitingCount();
+    response["usb_ready"] = static_cast<bool>(usbReady);
+    response["usb_paused"] = pausedByUsb;
+    response["network"] = networks.currentSSID();
+    response["ip"] = networks.address();
+    response["setup_mode"] = networks.setupMode();
+    response["network_exhausted"] = networks.exhausted();
 
     JsonArray passages =
         response["passages"].to<JsonArray>();
 
-    for (size_t i = 0; i < passageQueue.waitingCount(); ++i) {
-        passages.add(passageQueue.passage(i));
+    for (size_t i = 0; i < queue.waitingCount(); ++i) {
+        passages.add(queue.passage(i));
     }
 
     sendJson(200, response);
 }
 
 
-/** Execute passage queue and playback commands. */
+/** Apply validated queue or playback commands. */
 void handleAction() {
-    if (!authorizeSession()) {
-        return;
-    }
+    if (!authorized()) return;
 
     JsonDocument request;
+    if (!readJson(request)) return;
 
-    if (!readRequest(request)) {
-        return;
-    }
+    const String command = request["action"] | "";
 
-    const String action = request["action"] | "";
     const int index = request["index"].is<int>()
         ? request["index"].as<int>()
         : -1;
 
-    bool success = false;
+    bool ok = false;
     const char* message = "Unknown action.";
 
-    if (action == "add" || action == "edit") {
+    if (command == "add" || command == "edit") {
         if (!request["text"].is<const char*>()) {
             sendError(400, "Text must be a string.");
             return;
@@ -214,146 +233,161 @@ void handleAction() {
 
         const String text = request["text"].as<String>();
 
-        if (!isSupportedText(text)) {
-            sendError(400, "Only ASCII text is supported.");
-            return;
-        }
+        ok = command == "add"
+            ? queue.add(text)
+            : (index >= 0 && queue.edit(index, text));
 
-        if (action == "add") {
-            success = passageQueue.add(text);
-        } else if (index >= 0) {
-            success = passageQueue.edit(index, text);
-        }
-
-        message = success
+        message = ok
             ? "Passage saved."
-            : "Invalid passage or queue position.";
+            : "Invalid ASCII passage or queue is full.";
 
-    } else if (action == "remove") {
-        success = index >= 0 && passageQueue.remove(index);
-        message = success
+    } else if (command == "remove") {
+        ok = index >= 0 && queue.remove(index);
+
+        message = ok
             ? "Passage removed."
             : "Invalid queue position.";
 
-    } else if (action == "move") {
-        const String direction = request["direction"] | "";
+    } else if (command == "move") {
+        const String dir = request["direction"] | "";
 
         const int offset =
-            direction == "up" ? -1 :
-            direction == "down" ? 1 : 0;
+            dir == "up" ? -1 :
+            dir == "down" ? 1 : 0;
 
-        success = index >= 0 && offset != 0 &&
-                  passageQueue.move(index, offset);
+        ok = index >= 0 &&
+             offset != 0 &&
+             queue.move(index, offset);
 
-        message = success
-            ? "Queue order updated."
+        message = ok
+            ? "Queue reordered."
             : "Invalid move.";
 
-    } else if (action == "start") {
-        success = passageQueue.start();
-        message = success ? "Started." : "Cannot start.";
+    } else if (command == "start") {
+        ok = usbReady && queue.start();
 
-        if (success) {
-            lastKeyTime = millis();
+        if (ok) {
+            pausedByUsb = false;
+            lastKeyAt = millis();
         }
 
-    } else if (action == "pause") {
-        success = passageQueue.pause();
-        message = success ? "Paused." : "Cannot pause.";
+        message = ok
+            ? "Started."
+            : "Cannot start: check queue and USB connection.";
 
-    } else if (action == "resume") {
-        success = passageQueue.resume();
-        message = success ? "Resumed." : "Cannot resume.";
+    } else if (command == "pause") {
+        ok = queue.pause();
 
-        if (success) {
-            lastKeyTime = millis();
+        message = ok
+            ? "Paused."
+            : "Not currently typing.";
+
+    } else if (command == "resume") {
+        ok = usbReady && queue.resume();
+
+        if (ok) {
+            pausedByUsb = false;
+            lastKeyAt = millis();
         }
 
-    } else if (action == "stop") {
-        success = passageQueue.stop();
-        message = success
-            ? "Stopped. Passage returned to queue."
-            : "Cannot stop.";
+        message = ok
+            ? "Resumed."
+            : "Cannot resume: check USB connection.";
+
+    } else if (command == "stop") {
+        ok = queue.stop();
+
+        if (ok) {
+            pausedByUsb = false;
+        }
+
+        message = ok
+            ? "Stopped; passage returned to queue."
+            : "Already idle.";
     }
 
     JsonDocument response;
-    response["ok"] = success;
+    response["ok"] = ok;
     response["message"] = message;
 
-    sendJson(success ? 200 : 400, response);
+    sendJson(ok ? 200 : 400, response);
 }
 
 
-/** Return saved Wi-Fi network names without their passwords. */
+/** List saved Wi-Fi network names, excluding passwords. */
 void handleNetworks() {
+    if (!authorized()) return;
+
     JsonDocument response;
 
-    JsonArray networks =
+    JsonArray saved =
         response["networks"].to<JsonArray>();
 
-    for (int i = 0; i < networkManager.networkCount(); ++i) {
-        networks.add(networkManager.networkName(i));
+    for (int i = 0; i < networks.count(); ++i) {
+        saved.add(networks.name(i));
     }
 
     sendJson(200, response);
 }
 
 
-/** Add, update, or remove a saved Wi-Fi profile. */
+/** Modify persistent network profiles through the API. */
 void handleNetworkAction() {
-    if (!authorizeSession()) {
-        return;
-    }
+    if (!authorized()) return;
 
     JsonDocument request;
+    if (!readJson(request)) return;
 
-    if (!readRequest(request)) {
-        return;
-    }
+    const String command = request["action"] | "";
+    bool ok = false;
 
-    const String action = request["action"] | "";
-    bool success = false;
-
-    if (action == "add") {
+    if (command == "add") {
         if (!request["ssid"].is<const char*>() ||
             !request["password"].is<const char*>()) {
-            sendError(400, "Invalid network configuration.");
+
+            sendError(400, "Invalid Wi-Fi fields.");
             return;
         }
 
-        success = networkManager.addNetwork(
+        ok = networks.addOrUpdate(
             request["ssid"].as<String>(),
             request["password"].as<String>()
         );
 
-    } else if (action == "remove") {
+    } else if (command == "remove") {
         const int index = request["index"].is<int>()
             ? request["index"].as<int>()
             : -1;
 
-        success = networkManager.removeNetwork(index);
+        ok = networks.remove(index);
     }
 
     JsonDocument response;
-    response["ok"] = success;
-    response["message"] = success
-        ? "Network configuration saved."
-        : "Network configuration rejected.";
 
-    sendJson(success ? 200 : 400, response);
+    response["ok"] = ok;
+    response["message"] = ok
+        ? "Network saved. Connection may change."
+        : "Network change rejected.";
+
+    sendJson(ok ? 200 : 400, response);
 }
 
 
-/** Register HTTP endpoints used by the HIDLab interface. */
+/** Register HTTP endpoints. */
 void configureServer() {
-    const char* headers[] = {"X-HIDLab-Session"};
+    const char* headers[] = {
+        "X-HIDLab-Session"
+    };
+
     server.collectHeaders(headers, 1);
 
     server.on("/", HTTP_GET, handleRoot);
-    server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/session", HTTP_POST, handleSession);
+    server.on("/api/release", HTTP_POST, handleRelease);
+    server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/action", HTTP_POST, handleAction);
     server.on("/api/networks", HTTP_GET, handleNetworks);
+
     server.on(
         "/api/networks/action",
         HTTP_POST,
@@ -368,64 +402,82 @@ void configureServer() {
 }
 
 
-/**
- * Send the next ASCII character while playback is active.
- *
- * The current queue implementation advances before USB
- * delivery is confirmed. USB recovery remains provisional.
- */
-void processKeyboard() {
-    if (passageQueue.state() != PassageQueue::State::Typing) {
-        return;
+/** Pause active output when USB disconnects or suspends. */
+void maintainUsb() {
+    if (!usbLost) return;
+
+    usbLost = false;
+
+    if (queue.state() == PassageQueue::State::Typing) {
+        if (queue.pause()) {
+            pausedByUsb = true;
+        }
     }
-
-    const unsigned long now = millis();
-
-    if (now - lastKeyTime < KEY_INTERVAL_MS) {
-        return;
-    }
-
-    lastKeyTime = now;
-
-    char character;
-
-    if (!passageQueue.nextCharacter(character)) {
-        return;
-    }
-
-    // Ignore carriage returns so Windows CRLF becomes
-    // a single Enter event rather than two line breaks.
-    if (character == '\r') {
-        return;
-    }
-
-    Keyboard.write(static_cast<uint8_t>(character));
 }
 
 
-/** Initialize the USB device and network services. */
+/** Send one queued ASCII character to the USB keyboard interface. */
+void processKeyboard() {
+    if (!usbReady ||
+        queue.state() != PassageQueue::State::Typing) {
+        return;
+    }
+
+    if (millis() - lastKeyAt < KEY_INTERVAL_MS) {
+        return;
+    }
+
+    lastKeyAt = millis();
+
+    char character;
+
+    if (!queue.peek(character)) {
+        return;
+    }
+
+    if (Keyboard.write(static_cast<uint8_t>(character)) == 1 &&
+        usbReady) {
+
+        queue.advance();
+
+    } else if (!usbReady) {
+        maintainUsb();
+    }
+}
+
+
 void setup() {
     Serial.begin(115200);
 
+    USB.onEvent(usbEvent);
     Keyboard.begin();
     USB.begin();
 
     configureServer();
-    networkManager.begin();
+    networks.begin();
 
-    Serial.println("HIDLab initialized.");
+    networkGeneration = networks.generation();
+
+    Serial.println("HIDLab ready");
 }
 
 
-/** Service network, HTTP, and keyboard operations. */
 void loop() {
-    networkManager.update();
+    maintainUsb();
+    networks.update();
 
-    if (networkManager.connected() ||
-        networkManager.setupMode()) {
+    if (networkGeneration != networks.generation()) {
+        // Network changes invalidate sessions from the previous address.
+        networkGeneration = networks.generation();
+        controllerToken = "";
+    }
+
+    if (networks.connected() || networks.setupMode()) {
         server.handleClient();
     }
 
+    maintainUsb();
     processKeyboard();
+
     delay(1);
 }

@@ -3,505 +3,688 @@
 
 #include <Arduino.h>
 
-const char INDEX_HTML[] PROGMEM = R"hidlab(
-<!DOCTYPE html>
+const char INDEX_HTML[] PROGMEM = R"HIDLAB(
+<!doctype html>
 <html lang="en">
+
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HIDLab</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HIDLab</title>
 
-  <style>
-    * { box-sizing: border-box; }
+<style>
+  * {
+    box-sizing: border-box;
+  }
 
-    body {
-      margin: 0;
-      background: #111827;
-      color: #f9fafb;
-      font-family: system-ui, sans-serif;
-    }
+  body {
+    background: #111827;
+    color: #f9fafb;
+    font: 16px system-ui, sans-serif;
+    margin: 0;
+  }
 
-    main {
-      max-width: 650px;
-      margin: 32px auto;
-      padding: 16px;
-    }
+  main {
+    max-width: 720px;
+    margin: 24px auto;
+    padding: 14px;
+  }
 
-    h1 { margin-bottom: 4px; }
-    p, .muted { color: #9ca3af; }
+  h1 { margin: 0; }
 
-    section {
-      background: #1f2937;
-      padding: 20px;
-      border-radius: 12px;
-      margin-top: 18px;
-    }
+  h2 {
+    font-size: 1.2rem;
+    margin-top: 0;
+  }
 
-    input, textarea {
-      width: 100%;
-      padding: 12px;
-      margin: 6px 0;
-      background: #111827;
-      color: white;
-      border: 1px solid #4b5563;
-      border-radius: 8px;
-      font: inherit;
-    }
+  p, .muted {
+    color: #9ca3af;
+  }
 
-    textarea {
-      min-height: 140px;
-      resize: vertical;
-    }
+  section {
+    background: #1f2937;
+    border-radius: 12px;
+    padding: 19px;
+    margin-top: 18px;
+  }
 
-    button {
-      border: 0;
-      padding: 10px 12px;
-      border-radius: 8px;
-      background: #374151;
-      color: white;
-      font: inherit;
-      cursor: pointer;
-    }
+  input, textarea {
+    display: block;
+    width: 100%;
+    background: #111827;
+    color: #fff;
+    border: 1px solid #64748b;
+    border-radius: 8px;
+    padding: 12px;
+    font: inherit;
+    margin: 8px 0;
+  }
 
-    button:disabled {
-      opacity: .4;
-      cursor: default;
-    }
+  textarea {
+    min-height: 140px;
+    resize: vertical;
+  }
 
-    .primary { background: #2563eb; }
-    .danger { background: #991b1b; }
-    .full { width: 100%; margin-top: 8px; }
+  button {
+    background: #374151;
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: inherit;
+    cursor: pointer;
+  }
 
-    .controls {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
+  button:disabled {
+    opacity: .35;
+    cursor: not-allowed;
+  }
 
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 10px 0;
-    }
+  .primary { background: #2563eb; }
+  .danger { background: #991b1b; }
+  .full { width: 100%; }
 
-    .item {
-      padding: 12px 0;
-      border-bottom: 1px solid #374151;
-      overflow-wrap: anywhere;
-    }
+  .controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
 
-    .item:last-child { border-bottom: 0; }
+  .actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 9px;
+  }
 
-    #queue, #networks {
-      list-style: none;
-      padding: 0;
-    }
+  .item {
+    padding: 12px 0;
+    border-bottom: 1px solid #374151;
+    overflow-wrap: anywhere;
+  }
 
-    #status { font-weight: bold; }
+  .item:last-child {
+    border-bottom: none;
+  }
 
-    [hidden] { display: none !important; }
-  </style>
+  ul {
+    padding: 0;
+    list-style: none;
+  }
+
+  #status {
+    font-weight: 700;
+  }
+
+  [hidden] {
+    display: none !important;
+  }
+
+  .small {
+    font-size: .85rem;
+  }
+
+  #message {
+    min-height: 1.5em;
+  }
+
+  @media (max-width: 440px) {
+    main { padding: 10px; }
+    section { padding: 15px; }
+    .actions button { font-size: .86rem; }
+  }
+</style>
 </head>
 
 <body>
 <main>
+
+<header>
   <h1>HIDLab</h1>
-  <p>USB HID Research Platform</p>
+  <p>USB HID research platform</p>
+</header>
 
-  <section>
-    <h2>Device Status</h2>
-    <div id="status">Connecting...</div>
-    <p id="networkStatus"></p>
-    <p id="sessionStatus" class="muted"></p>
-    <p id="message" aria-live="polite"></p>
-  </section>
+<section>
+  <h2>Device</h2>
 
-  <section>
-    <h2>Text Queue</h2>
+  <div id="status">Connecting...</div>
+  <p class="small" id="usb"></p>
+  <p class="small" id="network"></p>
 
-    <textarea
-      id="textInput"
-      maxlength="12000"
-      placeholder="Enter an ASCII passage..."
-    ></textarea>
+  <p id="controller" class="muted">
+    Connecting controller...
+  </p>
 
-    <button class="primary full" onclick="action('add')">
-      Add to Queue
-    </button>
+  <button id="reclaim" onclick="requestControl()" hidden>
+    Request control
+  </button>
 
-    <h3>Waiting Passages</h3>
-    <ul id="queue"></ul>
+  <button id="release" onclick="releaseControl()" hidden>
+    Release control
+  </button>
 
-    <div id="editor" hidden>
-      <h3>Edit Passage</h3>
-      <textarea id="editInput" maxlength="12000"></textarea>
+  <p id="message" role="status"></p>
+</section>
 
-      <div class="controls">
-        <button class="primary" onclick="saveEdit()">Save</button>
-        <button onclick="cancelEdit()">Cancel</button>
-      </div>
-    </div>
-  </section>
+<section>
+  <h2>Queue</h2>
 
-  <section>
-    <h2>Playback Controls</h2>
+  <textarea
+    id="newText"
+    maxlength="12000"
+    placeholder="Enter plain ASCII text..."
+  ></textarea>
+
+  <button
+    id="add"
+    class="primary full"
+    onclick="action('add')"
+  >
+    Add to queue
+  </button>
+
+  <ul id="queue"></ul>
+  <p id="noQueue" class="muted">No passages waiting.</p>
+
+  <div id="editor" hidden>
+    <h2>Edit passage</h2>
+
+    <textarea id="editText" maxlength="12000"></textarea>
 
     <div class="controls">
-      <button id="start" class="primary"
-              onclick="action('start')">Start</button>
-      <button id="pause"
-              onclick="action('pause')">Pause</button>
-      <button id="resume"
-              onclick="action('resume')">Resume</button>
-      <button id="stop"
-              onclick="action('stop')">Stop</button>
+      <button class="primary" onclick="saveEdit()">
+        Save changes
+      </button>
+
+      <button onclick="cancelEdit()">
+        Cancel
+      </button>
     </div>
-  </section>
+  </div>
+</section>
 
-  <section>
-    <h2>Wi-Fi Networks</h2>
-    <p>Saved network passwords are not displayed.</p>
+<section>
+  <h2>Playback</h2>
 
-    <ul id="networks"></ul>
+  <div class="controls">
+    <button id="start" class="primary"
+      onclick="action('start')">Start</button>
 
-    <h3>Add or Update Network</h3>
+    <button id="pause"
+      onclick="action('pause')">Pause</button>
 
-    <input id="ssid" maxlength="32"
-           placeholder="Wi-Fi network name">
+    <button id="resume"
+      onclick="action('resume')">Resume</button>
 
-    <input id="password" type="password"
-           maxlength="63"
-           placeholder="Wi-Fi password">
+    <button id="stop"
+      onclick="action('stop')">Stop</button>
+  </div>
+</section>
 
-    <button class="primary full" onclick="saveNetwork()">
-      Save Network
-    </button>
+<section>
+  <h2>Saved Wi-Fi networks</h2>
 
-    <p class="muted">
-      Saving a network may disconnect this webpage temporarily.
-    </p>
-  </section>
+  <ul id="networks"></ul>
+
+  <input
+    id="ssid"
+    maxlength="32"
+    placeholder="Network name (SSID)"
+    autocomplete="off"
+  >
+
+  <input
+    id="password"
+    type="password"
+    maxlength="63"
+    placeholder="Network password"
+    autocomplete="off"
+  >
+
+  <button
+    id="saveNetwork"
+    class="primary full"
+    onclick="saveNetwork()"
+  >
+    Save network
+  </button>
+
+  <p class="small">
+    Saving or removing a network can change the connection.
+    Passwords are never displayed.
+  </p>
+</section>
+
 </main>
 
 <script>
-  const tokenKey = "hidlab-session-token";
+const $ = id => document.getElementById(id);
 
-  let token = localStorage.getItem(tokenKey);
+const key = 'hidlab-controller-token';
+let token = localStorage.getItem(key);
 
-  if (!token) {
-    const bytes = new Uint8Array(24);
-    crypto.getRandomValues(bytes);
+if (!token) {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
 
-    token = Array.from(bytes, byte =>
-      byte.toString(16).padStart(2, "0")
-    ).join("");
+  token = Array.from(
+    bytes,
+    x => x.toString(16).padStart(2, '0')
+  ).join('');
 
-    localStorage.setItem(tokenKey, token);
+  localStorage.setItem(key, token);
+}
+
+let controller = false;
+let autoClaim = true;
+let busy = false;
+let passages = [];
+let editing = null;
+let lastStatus = null;
+
+
+/** Acquire or renew the single-controller session. */
+async function claimSession() {
+  if (!autoClaim) return;
+
+  try {
+    const response = await fetch('/api/session', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ token })
+    });
+
+    controller = response.ok;
+
+    $('controller').textContent = controller
+      ? 'Controller connected'
+      : 'Another controller is connected';
+
+  } catch {
+    controller = false;
+    $('controller').textContent = 'Controller disconnected';
   }
 
-  let controller = false;
-  let passages = [];
-  let editingIndex = null;
-  let busy = false;
+  $('release').hidden = !controller;
+  $('reclaim').hidden = controller;
 
-  const element = id => document.getElementById(id);
+  setControls();
+}
 
-  /**
-   * Acquire or renew the browser's controller session.
-   */
-  async function claimSession() {
-    try {
-      const response = await fetch("/api/session", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({token})
-      });
 
-      controller = response.ok;
+async function requestControl() {
+  autoClaim = true;
 
-      element("sessionStatus").textContent = controller
-        ? "Controller connected"
-        : "Another device is controlling HIDLab";
+  await claimSession();
+  await refresh();
+  await refreshNetworks();
+}
 
-    } catch {
+
+async function releaseControl() {
+  if (!controller) return;
+
+  try {
+    await fetch('/api/release', {
+      method: 'POST',
+      headers: {
+        'X-HIDLab-Session': token
+      }
+    });
+  } catch {}
+
+  controller = false;
+  autoClaim = false;
+
+  $('controller').textContent = 'Controller released';
+  $('release').hidden = true;
+  $('reclaim').hidden = false;
+
+  setControls();
+}
+
+
+/** Send an authenticated JSON command to the device. */
+async function post(path, payload) {
+  if (!controller || busy) return false;
+
+  busy = true;
+
+  try {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-HIDLab-Session': token
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await response.json();
+
+    $('message').textContent =
+      data.message || data.error || '';
+
+    if (response.status === 423) {
       controller = false;
-      element("sessionStatus").textContent =
-        "Controller unavailable";
-    }
-  }
-
-  /**
-   * Submit an authenticated JSON command to an API endpoint.
-   */
-  async function post(path, payload) {
-    if (!controller || busy) {
-      return false;
+      await claimSession();
     }
 
-    busy = true;
+    return response.ok;
 
-    try {
-      const response = await fetch(path, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-HIDLab-Session": token
-        },
-        body: JSON.stringify(payload)
-      });
+  } catch {
+    $('message').textContent = 'Connection lost';
+    return false;
 
-      const result = await response.json();
+  } finally {
+    busy = false;
+  }
+}
 
-      element("message").textContent =
-        result.message || result.error || "";
 
-      if (response.status === 423) {
-        controller = false;
-      }
+/** Submit a queue or playback operation. */
+async function action(command, options = {}) {
+  const text = command === 'add'
+    ? $('newText').value
+    : (options.text ?? '');
 
-      return response.ok;
-
-    } catch {
-      element("message").textContent = "Connection lost.";
-      return false;
-
-    } finally {
-      busy = false;
-    }
+  if (
+    (command === 'add' || command === 'edit') &&
+    (/[^\x0A\x0D\x20-\x7E]/.test(text))
+  ) {
+    $('message').textContent =
+      'Only basic ASCII characters and line breaks are supported.';
+    return;
   }
 
-  /**
-   * Execute a passage queue or playback command.
-   */
-  async function action(name, options = {}) {
-    const success = await post("/api/action", {
-      action: name,
-      text: name === "add"
-        ? element("textInput").value
-        : (options.text ?? ""),
-      index: options.index ?? null,
-      direction: options.direction ?? null
-    });
+  const ok = await post('/api/action', {
+    action: command,
+    text,
+    index: options.index ?? null,
+    direction: options.direction ?? null
+  });
 
-    if (success) {
-      if (name === "add") {
-        element("textInput").value = "";
-      }
-
-      if (["remove", "move", "start", "stop"].includes(name)) {
-        cancelEdit();
-      }
+  if (ok) {
+    if (command === 'add') {
+      $('newText').value = '';
     }
 
-    await refresh();
-  }
-
-  /** Open the passage editor without changing queued text. */
-  function beginEdit(index) {
-    editingIndex = index;
-    element("editInput").value = passages[index];
-    element("editor").hidden = false;
-    element("editInput").focus();
-  }
-
-  /** Save the passage currently being edited. */
-  async function saveEdit() {
-    if (editingIndex === null) return;
-
-    const success = await post("/api/action", {
-      action: "edit",
-      index: editingIndex,
-      text: element("editInput").value
-    });
-
-    if (success) {
+    if (['remove', 'move', 'start', 'stop'].includes(command)) {
       cancelEdit();
     }
-
-    await refresh();
   }
 
-  /** Dismiss the editor without modifying the queue. */
-  function cancelEdit() {
-    editingIndex = null;
-    element("editInput").value = "";
-    element("editor").hidden = true;
+  await refresh();
+}
+
+
+function beginEdit(index) {
+  if (!controller || index < 0 || index >= passages.length) {
+    return;
   }
 
-  /** Build an action button for a queue or network item. */
-  function makeButton(label, handler, disabled = false, css = "") {
-    const button = document.createElement("button");
-    button.textContent = label;
-    button.type = "button";
-    button.disabled = disabled || !controller;
-    button.className = css;
-    button.addEventListener("click", handler);
-    return button;
+  editing = index;
+  $('editText').value = passages[index];
+  $('editor').hidden = false;
+  $('editText').focus();
+}
+
+
+function cancelEdit() {
+  editing = null;
+  $('editor').hidden = true;
+  $('editText').value = '';
+}
+
+
+async function saveEdit() {
+  if (editing === null) return;
+
+  const index = editing;
+  const text = $('editText').value;
+
+  if (/[^\x0A\x0D\x20-\x7E]/.test(text)) {
+    $('message').textContent =
+      'Only basic ASCII characters and line breaks are supported.';
+    return;
   }
 
-  /** Render the waiting queue and its management controls. */
-  function renderQueue() {
-    const list = element("queue");
+  const ok = await post('/api/action', {
+    action: 'edit',
+    index,
+    text
+  });
+
+  if (ok) cancelEdit();
+
+  await refresh();
+}
+
+
+/** Create queue and network controls using escaped text. */
+function button(label, callback, disabled = false, css = '') {
+  const b = document.createElement('button');
+
+  b.type = 'button';
+  b.textContent = label;
+  b.className = css;
+  b.disabled = disabled || !controller;
+  b.addEventListener('click', callback);
+
+  return b;
+}
+
+
+function renderQueue() {
+  const list = $('queue');
+  list.replaceChildren();
+
+  $('noQueue').hidden = passages.length > 0;
+
+  passages.forEach((text, index) => {
+    const li = document.createElement('li');
+    li.className = 'item';
+
+    const preview = document.createElement('div');
+
+    preview.textContent =
+      `Passage ${index + 1}: ${text.slice(0, 110)}` +
+      (text.length > 110 ? '...' : '');
+
+    const controls = document.createElement('div');
+    controls.className = 'actions';
+
+    controls.append(
+      button('Edit', () => beginEdit(index)),
+
+      button(
+        'Up',
+        () => action('move', { index, direction: 'up' }),
+        index === 0
+      ),
+
+      button(
+        'Down',
+        () => action('move', { index, direction: 'down' }),
+        index === passages.length - 1
+      ),
+
+      button(
+        'Remove',
+        () => action('remove', { index }),
+        false,
+        'danger'
+      )
+    );
+
+    li.append(preview, controls);
+    list.append(li);
+  });
+
+  if (editing !== null && editing >= passages.length) {
+    cancelEdit();
+  }
+}
+
+
+function setControls() {
+  const s = lastStatus || {};
+
+  $('add').disabled = !controller || busy;
+  $('saveNetwork').disabled = !controller || busy;
+
+  $('start').disabled =
+    !controller ||
+    s.status !== 'idle' ||
+    !s.queued ||
+    !s.usb_ready;
+
+  $('pause').disabled =
+    !controller || s.status !== 'typing';
+
+  $('resume').disabled =
+    !controller ||
+    s.status !== 'paused' ||
+    !s.usb_ready;
+
+  $('stop').disabled =
+    !controller || s.status === 'idle';
+}
+
+
+/** Poll device status and the waiting queue. */
+async function refresh() {
+  if (!controller) {
+    $('status').textContent = 'LOCKED';
+    setControls();
+    return;
+  }
+
+  try {
+    const response = await fetch('/api/status', {
+      headers: {
+        'X-HIDLab-Session': token
+      },
+      cache: 'no-store'
+    });
+
+    if (!response.ok) {
+      throw Error('Status unavailable');
+    }
+
+    const data = await response.json();
+    lastStatus = data;
+
+    $('status').textContent = data.status.toUpperCase();
+
+    $('usb').textContent = data.usb_ready
+      ? 'USB keyboard connected'
+      : 'USB keyboard unavailable';
+
+    $('network').textContent = data.setup_mode
+      ? `Setup Wi-Fi: ${data.ip}`
+      : `Wi-Fi: ${data.network || 'Offline'} ` +
+        `(${data.ip || 'no address'})`;
+
+    passages = data.passages;
+
+    renderQueue();
+    setControls();
+
+  } catch {
+    $('status').textContent = 'DISCONNECTED';
+    lastStatus = null;
+    setControls();
+  }
+}
+
+
+async function refreshNetworks() {
+  if (!controller) return;
+
+  try {
+    const response = await fetch('/api/networks', {
+      headers: {
+        'X-HIDLab-Session': token
+      }
+    });
+
+    if (!response.ok) {
+      throw Error('Networks unavailable');
+    }
+
+    const data = await response.json();
+    const list = $('networks');
+
     list.replaceChildren();
 
-    passages.forEach((text, index) => {
-      const item = document.createElement("li");
-      item.className = "item";
+    data.networks.forEach((ssid, index) => {
+      const li = document.createElement('li');
+      li.className = 'item';
 
-      const preview = document.createElement("div");
-      preview.textContent =
-        `Passage ${index + 1}: ${text.slice(0, 100)}` +
-        (text.length > 100 ? "..." : "");
+      const label = document.createElement('span');
+      label.textContent = ssid + ' ';
 
-      const buttons = document.createElement("div");
-      buttons.className = "actions";
-
-      buttons.append(
-        makeButton("Edit", () => beginEdit(index)),
-        makeButton(
-          "Up",
-          () => action("move", {index, direction: "up"}),
-          index === 0
-        ),
-        makeButton(
-          "Down",
-          () => action("move", {index, direction: "down"}),
-          index === passages.length - 1
-        ),
-        makeButton(
-          "Remove",
-          () => action("remove", {index}),
+      li.append(
+        label,
+        button(
+          'Remove',
+          () => removeNetwork(index),
           false,
-          "danger"
+          'danger'
         )
       );
 
-      item.append(preview, buttons);
-      list.appendChild(item);
+      list.append(li);
     });
 
-    if (editingIndex !== null &&
-        editingIndex >= passages.length) {
-      cancelEdit();
-    }
+  } catch {
+    $('message').textContent = 'Cannot load network list';
+  }
+}
+
+
+async function saveNetwork() {
+  const ok = await post('/api/networks/action', {
+    action: 'add',
+    ssid: $('ssid').value,
+    password: $('password').value
+  });
+
+  if (ok) {
+    $('ssid').value = '';
+    $('password').value = '';
   }
 
-  /** Display saved network names and removal controls. */
-  async function refreshNetworks() {
-    try {
-      const response = await fetch("/api/networks");
-      const data = await response.json();
+  await refreshNetworks();
+}
 
-      const list = element("networks");
-      list.replaceChildren();
 
-      data.networks.forEach((ssid, index) => {
-        const item = document.createElement("li");
-        item.className = "item";
+async function removeNetwork(index) {
+  await post('/api/networks/action', {
+    action: 'remove',
+    index
+  });
 
-        const label = document.createElement("span");
-        label.textContent = ssid + " ";
+  await refreshNetworks();
+}
 
-        const button = makeButton(
-          "Remove",
-          () => removeNetwork(index),
-          false,
-          "danger"
-        );
 
-        item.append(label, button);
-        list.appendChild(item);
-      });
-    } catch {
-      element("message").textContent =
-        "Could not load saved networks.";
-    }
-  }
+/** Initialize and periodically synchronize the interface. */
+async function initialize() {
+  await claimSession();
+  await refresh();
+  await refreshNetworks();
 
-  /** Save a Wi-Fi profile on the device. */
-  async function saveNetwork() {
-    const success = await post("/api/networks/action", {
-      action: "add",
-      ssid: element("ssid").value,
-      password: element("password").value
-    });
+  setInterval(refresh, 1500);
+  setInterval(claimSession, 8000);
+  setInterval(refreshNetworks, 12000);
+}
 
-    if (success) {
-      element("ssid").value = "";
-      element("password").value = "";
-    }
-
-    await refreshNetworks();
-  }
-
-  /** Delete a Wi-Fi profile by its displayed index. */
-  async function removeNetwork(index) {
-    await post("/api/networks/action", {
-      action: "remove",
-      index
-    });
-
-    await refreshNetworks();
-  }
-
-  /** Refresh playback, queue, and connectivity indicators. */
-  async function refresh() {
-    try {
-      const response = await fetch("/api/status", {
-        cache: "no-store"
-      });
-
-      if (!response.ok) {
-        throw new Error("Status unavailable");
-      }
-
-      const data = await response.json();
-
-      element("status").textContent = data.status.toUpperCase();
-
-      element("networkStatus").textContent =
-        data.setup_mode
-          ? `Setup network: ${data.ip}`
-          : `Wi-Fi: ${data.network || "Connecting"} (${data.ip})`;
-
-      passages = data.passages;
-      renderQueue();
-
-      element("start").disabled =
-        !controller || data.status !== "idle" || data.queued === 0;
-
-      element("pause").disabled =
-        !controller || data.status !== "typing";
-
-      element("resume").disabled =
-        !controller || data.status !== "paused";
-
-      element("stop").disabled =
-        !controller || data.status === "idle";
-
-    } catch {
-      element("status").textContent = "DISCONNECTED";
-
-      for (const id of ["start", "pause", "resume", "stop"]) {
-        element(id).disabled = true;
-      }
-    }
-  }
-
-  /** Initialize and periodically synchronize the interface. */
-  async function initialize() {
-    await claimSession();
-    await refresh();
-    await refreshNetworks();
-
-    setInterval(refresh, 1000);
-    setInterval(claimSession, 10000);
-    setInterval(refreshNetworks, 10000);
-  }
-
-  initialize();
+initialize();
 </script>
 </body>
 </html>
-)hidlab";
+)HIDLAB";

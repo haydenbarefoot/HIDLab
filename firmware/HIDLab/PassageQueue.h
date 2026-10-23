@@ -2,155 +2,138 @@
 #pragma once
 
 #include <Arduino.h>
+#include <ctype.h>
 
 class PassageQueue {
 public:
     static constexpr size_t MAX_PASSAGES = 2;
     static constexpr size_t MAX_CHARACTERS = 12000;
 
-    enum class State {
-        Idle,
-        Typing,
-        Paused
-    };
+    enum class State { Idle, Typing, Paused };
 
-    /**
-     * Add a passage to the end of the waiting queue.
-     * Returns false if the passage is invalid or capacity is reached.
-     */
+    static bool validText(const String& text) {
+        if (text.isEmpty() || text.length() > MAX_CHARACTERS) return false;
+
+        bool nonWhitespace = false;
+
+        for (size_t i = 0; i < text.length(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+
+            if (!((c >= 32 && c <= 126) || c == '\n' || c == '\r')) {
+                return false;
+            }
+
+            if (c != ' ' && c != '\n' && c != '\r') {
+                nonWhitespace = true;
+            }
+        }
+
+        return nonWhitespace;
+    }
+
     bool add(const String& text) {
         if (!validText(text) || totalCount() >= MAX_PASSAGES) {
             return false;
         }
 
-        passages_[count_++] = text;
+        waiting_[count_++] = normalize(text);
         return true;
     }
 
-    /** Remove a waiting passage by its zero-based index. */
-    bool remove(size_t index) {
-        if (index >= count_) {
-            return false;
-        }
-
-        for (size_t i = index; i + 1 < count_; ++i) {
-            passages_[i] = passages_[i + 1];
-        }
-
-        passages_[--count_] = "";
-        return true;
-    }
-
-    /** Replace the contents of a waiting passage. */
     bool edit(size_t index, const String& text) {
         if (index >= count_ || !validText(text)) {
             return false;
         }
 
-        passages_[index] = text;
+        waiting_[index] = normalize(text);
         return true;
     }
 
-    /**
-     * Move a waiting passage one position.
-     * Direction must be -1 (up) or 1 (down).
-     */
+    bool remove(size_t index) {
+        if (index >= count_) return false;
+
+        for (size_t i = index; i + 1 < count_; ++i) {
+            waiting_[i] = waiting_[i + 1];
+        }
+
+        waiting_[--count_] = "";
+        return true;
+    }
+
     bool move(size_t index, int direction) {
         if (index >= count_ || (direction != -1 && direction != 1)) {
             return false;
         }
 
-        int destination = static_cast<int>(index) + direction;
+        const int target = static_cast<int>(index) + direction;
 
-        if (destination < 0 ||
-            destination >= static_cast<int>(count_)) {
+        if (target < 0 || target >= static_cast<int>(count_)) {
             return false;
         }
 
-        String temporary = passages_[index];
-        passages_[index] = passages_[destination];
-        passages_[destination] = temporary;
-
+        String temp = waiting_[index];
+        waiting_[index] = waiting_[target];
+        waiting_[target] = temp;
         return true;
     }
 
-    /** Start the first waiting passage. */
     bool start() {
-        if (state_ != State::Idle || count_ == 0) {
-            return false;
-        }
+        if (state_ != State::Idle || count_ == 0) return false;
 
-        activeText_ = passages_[0];
-        active_ = true;
+        active_ = waiting_[0];
+        hasActive_ = true;
         position_ = 0;
 
         remove(0);
         state_ = State::Typing;
-
         return true;
     }
 
-    /** Suspend an active passage without resetting its position. */
     bool pause() {
-        if (state_ != State::Typing) {
-            return false;
-        }
-
+        if (state_ != State::Typing) return false;
         state_ = State::Paused;
         return true;
     }
 
-    /** Continue processing a paused passage. */
     bool resume() {
-        if (state_ != State::Paused) {
-            return false;
-        }
-
+        if (state_ != State::Paused) return false;
         state_ = State::Typing;
         return true;
     }
 
-    /** Return the active passage to the front of the waiting queue. */
     bool stop() {
-        if (state_ == State::Idle || !active_) {
-            return false;
-        }
+        if (!hasActive_ || state_ == State::Idle) return false;
 
-        // The active passage already counts toward the capacity limit.
+        // Restore the original passage ahead of other waiting items.
         for (size_t i = count_; i > 0; --i) {
-            passages_[i] = passages_[i - 1];
+            waiting_[i] = waiting_[i - 1];
         }
 
-        passages_[0] = activeText_;
+        waiting_[0] = active_;
         ++count_;
-
         clearActive();
         return true;
     }
 
-    /**
-     * Read and advance one character while typing.
-     * Returns false when there is no character available.
-     *
-     * This will later be called by the USB HID output task.
-     */
-    bool nextCharacter(char& output) {
-        if (state_ != State::Typing || !active_) {
+    /** Read the current character without advancing its position. */
+    bool peek(char& out) const {
+        if (!hasActive_ ||
+            state_ != State::Typing ||
+            position_ >= active_.length()) {
             return false;
         }
 
-        if (position_ >= activeText_.length()) {
-            clearActive();
-            return false;
-        }
-
-        output = activeText_[position_++];
-
-        if (position_ >= activeText_.length()) {
-            clearActive();
-        }
-
+        out = active_[position_];
         return true;
+    }
+
+    /** Advance after the keyboard backend accepts a character. */
+    void advance() {
+        if (state_ != State::Typing || !hasActive_) return;
+
+        if (++position_ >= active_.length()) {
+            clearActive();
+        }
     }
 
     size_t waitingCount() const {
@@ -158,7 +141,7 @@ public:
     }
 
     size_t totalCount() const {
-        return count_ + (active_ ? 1 : 0);
+        return count_ + static_cast<size_t>(hasActive_);
     }
 
     size_t position() const {
@@ -171,51 +154,33 @@ public:
 
     const String& passage(size_t index) const {
         static const String empty;
-        return index < count_ ? passages_[index] : empty;
+        return index < count_ ? waiting_[index] : empty;
     }
 
     const char* statusName() const {
-        switch (state_) {
-            case State::Typing:
-                return "typing";
-
-            case State::Paused:
-                return "paused";
-
-            default:
-                return "idle";
-        }
+        return state_ == State::Typing ? "typing" :
+               state_ == State::Paused ? "paused" : "idle";
     }
 
 private:
-    String passages_[MAX_PASSAGES];
-    size_t count_ = 0;
-
-    String activeText_;
-    size_t position_ = 0;
-    bool active_ = false;
-    State state_ = State::Idle;
-
-    /** Ensure passages contain non-whitespace text within the size limit. */
-    static bool validText(const String& text) {
-        if (text.isEmpty() || text.length() > MAX_CHARACTERS) {
-            return false;
-        }
-
-        for (size_t i = 0; i < text.length(); ++i) {
-            if (!isspace(static_cast<unsigned char>(text[i]))) {
-                return true;
-            }
-        }
-
-        return false;
+    static String normalize(const String& text) {
+        String result = text;
+        result.replace("\r\n", "\n");
+        result.replace("\r", "\n");
+        return result;
     }
 
-    /** Discard a completed or stopped passage and reset playback state. */
     void clearActive() {
-        activeText_ = "";
-        active_ = false;
+        active_ = "";
+        hasActive_ = false;
         position_ = 0;
         state_ = State::Idle;
     }
+
+    String waiting_[MAX_PASSAGES];
+    String active_;
+    size_t count_ = 0;
+    size_t position_ = 0;
+    bool hasActive_ = false;
+    State state_ = State::Idle;
 };

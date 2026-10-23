@@ -5,150 +5,179 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
-
 #include "wifi_credentials.h"
 
 #ifndef HIDLAB_SETUP_PASSWORD
-#define HIDLAB_SETUP_PASSWORD "ChangeThisPassword2026"
+#error Define HIDLAB_SETUP_PASSWORD in wifi_credentials.h
 #endif
 
 class NetworkManager {
 public:
     static constexpr int MAX_NETWORKS = 4;
-
-    struct Profile {
-        String ssid;
-        String password;
-    };
+    static constexpr unsigned long CONNECT_TIMEOUT_MS = 9000;
 
     void begin() {
-        preferences_.begin("hidlab-wifi", false);
-        loadProfiles();
+        if (!prefs_.begin("hidlab-wifi", false)) {
+            Serial.println("Wi-Fi storage unavailable");
+        }
 
-        // Import the original firmware credentials on first setup.
-        if (count_ == 0 && strlen(WIFI_SSID) > 0) {
-            addNetwork(WIFI_SSID, WIFI_PASSWORD);
+        load();
+
+        if (!prefs_.getBool("initialized", false)) {
+            prefs_.putBool("initialized", true);
+
+            if (count_ == 0 && strlen(WIFI_SSID) > 0) {
+                profiles_[0] = {
+                    String(WIFI_SSID),
+                    String(WIFI_PASSWORD)
+                };
+
+                count_ = 1;
+                persist();
+            }
         }
 
         WiFi.mode(WIFI_STA);
-        startNextConnection();
+        WiFi.setAutoReconnect(false);
+        startCycle(-1);
     }
 
-    /**
-     * Service connection attempts without blocking HTTP processing.
-     */
+    /** Progress connection attempts and manage fallback setup Wi-Fi. */
     void update() {
-        const bool connected = WiFi.status() == WL_CONNECTED;
+        if (reconfigureAt_ != 0 &&
+            static_cast<int32_t>(millis() - reconfigureAt_) >= 0) {
 
-        if (connected) {
+            reconfigureAt_ = 0;
+            WiFi.disconnect();
+            connectedIndex_ = -1;
+            wasConnected_ = false;
+            stopMdns();
+            startCycle(-1);
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
             if (!wasConnected_) {
                 wasConnected_ = true;
-                connecting_ = false;
-                attempts_ = 0;
+                ++generation_;
+                everConnected_ = true;
+                trying_ = false;
+                exhausted_ = false;
 
-                Serial.print("HIDLab: http://");
+                connectedIndex_ = orderPos_ < orderCount_
+                    ? order_[orderPos_]
+                    : -1;
+
+                Serial.print("HIDLab IP: http://");
                 Serial.println(WiFi.localIP());
 
                 if (MDNS.begin("hidlab")) {
+                    mdnsRunning_ = true;
                     MDNS.addService("http", "tcp", 80);
                 }
 
                 if (apActive_) {
-                    WiFi.softAPdisconnect(true);
+                    WiFi.softAPdisconnect(false);
                     apActive_ = false;
+                    WiFi.mode(WIFI_STA);
                 }
             }
+
             return;
         }
 
         if (wasConnected_) {
             wasConnected_ = false;
-            connecting_ = false;
-            MDNS.end();
-            attempts_ = 0;
-            profileIndex_ = 0;
+            ++generation_;
+            stopMdns();
+            startCycle(connectedIndex_);
         }
 
-        if (connecting_) {
-            if (millis() - attemptStarted_ < CONNECTION_TIMEOUT_MS) {
-                return;
-            }
+        if (exhausted_ || !trying_) return;
 
-            WiFi.disconnect();
-            connecting_ = false;
-            ++attempts_;
-
-            // Give the first network three attempts and each
-            // subsequent saved network one attempt.
-            if (profileIndex_ == 0 && attempts_ < 3) {
-                startNextConnection();
-                return;
-            }
-
-            ++profileIndex_;
-            attempts_ = 0;
+        if (millis() - attemptAt_ < CONNECT_TIMEOUT_MS) {
+            return;
         }
 
-        if (profileIndex_ < count_) {
-            startNextConnection();
-        } else if (!apActive_) {
-            startAccessPoint();
+        WiFi.disconnect();
+        ++attemptsOnProfile_;
+
+        const int maxAttempts = orderPos_ == 0 ? 3 : 1;
+
+        if (attemptsOnProfile_ >= maxAttempts) {
+            ++orderPos_;
+            attemptsOnProfile_ = 0;
         }
+
+        attemptNext();
     }
 
-    /**
-     * Store a network profile in flash and restart discovery.
-     */
-    bool addNetwork(const String& ssid, const String& password) {
-        if (ssid.isEmpty() || ssid.length() > 32 ||
-            password.length() > 63) {
+    /** Add or update a saved Wi-Fi profile. */
+    bool addOrUpdate(const String& ssid, const String& password) {
+        if (ssid.isEmpty() ||
+            ssid.length() > 32 ||
+            !(password.isEmpty() ||
+              (password.length() >= 8 && password.length() <= 63))) {
             return false;
         }
 
-        // Update an existing profile rather than duplicating it.
+        int index = -1;
+
         for (int i = 0; i < count_; ++i) {
             if (profiles_[i].ssid == ssid) {
-                profiles_[i].password = password;
-                saveProfiles();
-                restartConnections();
-                return true;
+                index = i;
+                break;
             }
         }
 
-        if (count_ >= MAX_NETWORKS) {
-            return false;
+        if (index < 0) {
+            if (count_ >= MAX_NETWORKS) return false;
+            index = count_++;
         }
 
-        profiles_[count_++] = {ssid, password};
-        saveProfiles();
-        restartConnections();
+        profiles_[index] = {ssid, password};
+        persist();
+
+        // Wait for the HTTP response before changing connections.
+        if (!connected() || connectedIndex_ == index) {
+            scheduleReconnect();
+        }
+
         return true;
     }
 
-    /** Remove a saved network by index. */
-    bool removeNetwork(int index) {
-        if (index < 0 || index >= count_) {
-            return false;
-        }
+    bool remove(int index) {
+        if (index < 0 || index >= count_) return false;
+
+        const bool removingCurrent = index == connectedIndex_;
 
         for (int i = index; i < count_ - 1; ++i) {
             profiles_[i] = profiles_[i + 1];
         }
 
         profiles_[--count_] = {"", ""};
-        saveProfiles();
-        restartConnections();
+        persist();
+
+        if (removingCurrent || !connected()) {
+            scheduleReconnect();
+        } else if (connectedIndex_ > index) {
+            --connectedIndex_;
+        }
+
         return true;
     }
 
-    int networkCount() const {
+    uint32_t generation() const {
+        return generation_;
+    }
+
+    int count() const {
         return count_;
     }
 
-    String networkName(int index) const {
+    String name(int index) const {
         return index >= 0 && index < count_
             ? profiles_[index].ssid
-            : "";
+            : String();
     }
 
     bool connected() const {
@@ -159,105 +188,177 @@ public:
         return apActive_;
     }
 
-    String address() const {
-        if (connected()) {
-            return WiFi.localIP().toString();
-        }
-
-        if (apActive_) {
-            return WiFi.softAPIP().toString();
-        }
-
-        return "";
+    bool exhausted() const {
+        return exhausted_;
     }
 
     String currentSSID() const {
-        return connected() ? WiFi.SSID() : "";
+        return connected() ? WiFi.SSID() : String();
+    }
+
+    String address() const {
+        if (connected()) return WiFi.localIP().toString();
+        if (apActive_) return WiFi.softAPIP().toString();
+        return String();
     }
 
 private:
-    static constexpr unsigned long CONNECTION_TIMEOUT_MS = 8000;
+    struct Profile {
+        String ssid;
+        String password;
+    };
 
-    Preferences preferences_;
+    Preferences prefs_;
     Profile profiles_[MAX_NETWORKS];
 
     int count_ = 0;
-    int profileIndex_ = 0;
-    int attempts_ = 0;
+    uint32_t generation_ = 0;
+    int order_[MAX_NETWORKS] = {};
+    int orderCount_ = 0;
+    int orderPos_ = 0;
+    int attemptsOnProfile_ = 0;
+    int connectedIndex_ = -1;
 
+    bool trying_ = false;
     bool wasConnected_ = false;
-    bool connecting_ = false;
+    bool everConnected_ = false;
+    bool exhausted_ = false;
     bool apActive_ = false;
+    bool mdnsRunning_ = false;
 
-    unsigned long attemptStarted_ = 0;
+    unsigned long attemptAt_ = 0;
+    unsigned long reconfigureAt_ = 0;
 
-    /** Read saved Wi-Fi profiles from nonvolatile storage. */
-    void loadProfiles() {
+    void load() {
         count_ = constrain(
-            preferences_.getInt("count", 0),
+            prefs_.getInt("count", 0),
             0,
             MAX_NETWORKS
         );
 
         for (int i = 0; i < count_; ++i) {
-            String prefix = "wifi" + String(i);
+            const String key = "wifi" + String(i);
+
             profiles_[i].ssid =
-                preferences_.getString((prefix + "s").c_str(), "");
+                prefs_.getString((key + "s").c_str(), "");
+
             profiles_[i].password =
-                preferences_.getString((prefix + "p").c_str(), "");
+                prefs_.getString((key + "p").c_str(), "");
         }
     }
 
-    /** Replace saved profiles without exposing passwords via HTTP. */
-    void saveProfiles() {
-        preferences_.putInt("count", count_);
+    void persist() {
+        prefs_.putInt("count", count_);
 
         for (int i = 0; i < MAX_NETWORKS; ++i) {
-            String prefix = "wifi" + String(i);
+            const String key = "wifi" + String(i);
 
-            preferences_.putString(
-                (prefix + "s").c_str(),
-                i < count_ ? profiles_[i].ssid : ""
+            prefs_.putString(
+                (key + "s").c_str(),
+                i < count_ ? profiles_[i].ssid : String()
             );
 
-            preferences_.putString(
-                (prefix + "p").c_str(),
-                i < count_ ? profiles_[i].password : ""
+            prefs_.putString(
+                (key + "p").c_str(),
+                i < count_ ? profiles_[i].password : String()
             );
         }
     }
 
-    /** Attempt the current saved network. */
-    void startNextConnection() {
-        if (profileIndex_ >= count_) {
-            startAccessPoint();
+    void stopMdns() {
+        if (mdnsRunning_) MDNS.end();
+        mdnsRunning_ = false;
+    }
+
+    void scheduleReconnect() {
+        reconfigureAt_ = millis() + 1500;
+    }
+
+    /** Prefer a visible saved network or the last connected one. */
+    void startCycle(int preferredIndex) {
+        exhausted_ = false;
+        trying_ = false;
+        orderCount_ = 0;
+        orderPos_ = 0;
+        attemptsOnProfile_ = 0;
+
+        if (count_ == 0) {
+            finishCycle();
             return;
         }
 
+        if (preferredIndex < 0 || preferredIndex >= count_) {
+            const int found = WiFi.scanNetworks(false, false);
+            int strongest = -999;
+
+            for (int scan = 0; scan < found; ++scan) {
+                for (int i = 0; i < count_; ++i) {
+                    if (WiFi.SSID(scan) == profiles_[i].ssid &&
+                        WiFi.RSSI(scan) > strongest) {
+
+                        preferredIndex = i;
+                        strongest = WiFi.RSSI(scan);
+                    }
+                }
+            }
+
+            WiFi.scanDelete();
+
+            if (preferredIndex < 0) {
+                preferredIndex = 0;
+            }
+        }
+
+        order_[orderCount_++] = preferredIndex;
+
+        for (int i = 0; i < count_; ++i) {
+            if (i != preferredIndex) {
+                order_[orderCount_++] = i;
+            }
+        }
+
+        attemptNext();
+    }
+
+    void attemptNext() {
+        if (orderPos_ >= orderCount_) {
+            finishCycle();
+            return;
+        }
+
+        const Profile& profile = profiles_[order_[orderPos_]];
+
         WiFi.mode(apActive_ ? WIFI_AP_STA : WIFI_STA);
-
-        const Profile& profile = profiles_[profileIndex_];
-
-        Serial.print("Connecting to ");
-        Serial.println(profile.ssid);
 
         WiFi.begin(
             profile.ssid.c_str(),
             profile.password.c_str()
         );
 
-        connecting_ = true;
-        attemptStarted_ = millis();
+        trying_ = true;
+        attemptAt_ = millis();
+
+        Serial.print("Trying Wi-Fi: ");
+        Serial.println(profile.ssid);
     }
 
-    /** Start a password-protected setup network. */
-    void startAccessPoint() {
-        if (apActive_) {
-            return;
+    void finishCycle() {
+        trying_ = false;
+        exhausted_ = true;
+
+        // After losing a working connection, wait for device restart.
+        if (!everConnected_) {
+            startAccessPoint();
         }
 
+        Serial.println("Saved Wi-Fi attempts exhausted");
+    }
+
+    void startAccessPoint() {
+        if (apActive_) return;
+
         if (strlen(HIDLAB_SETUP_PASSWORD) < 8) {
-            Serial.println("Invalid setup AP password.");
+            Serial.println("Setup password must be at least 8 characters");
             return;
         }
 
@@ -269,20 +370,10 @@ private:
         );
 
         if (apActive_) {
-            Serial.print("Setup network: http://");
+            ++generation_;
+
+            Serial.print("Setup AP: http://");
             Serial.println(WiFi.softAPIP());
         }
-    }
-
-    /** Restart network discovery following a profile change. */
-    void restartConnections() {
-        WiFi.disconnect();
-        wasConnected_ = false;
-        connecting_ = false;
-        profileIndex_ = 0;
-        attempts_ = 0;
-        MDNS.end();
-
-        startNextConnection();
     }
 };
