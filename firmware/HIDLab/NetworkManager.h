@@ -1,16 +1,27 @@
 
 #pragma once
 
+#ifndef HIDLAB_STARTUP_DIAGNOSTICS
+#define HIDLAB_STARTUP_DIAGNOSTICS 0
+#endif
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+
 #include "wifi_credentials.h"
 
 #ifndef HIDLAB_SETUP_PASSWORD
 #error Define HIDLAB_SETUP_PASSWORD in wifi_credentials.h
 #endif
 
+/**
+ * Manages HIDLab Wi-Fi profiles and fallback setup access.
+ *
+ * The network defined in wifi_credentials.h is the primary
+ * network and is synchronized on every firmware startup.
+ */
 class NetworkManager {
 public:
     static constexpr int MAX_NETWORKS = 4;
@@ -18,68 +29,83 @@ public:
 
     void begin() {
         if (!prefs_.begin("hidlab-wifi", false)) {
-            Serial.println("Wi-Fi storage unavailable");
+            Serial.println("Wi-Fi preferences unavailable.");
         }
 
         load();
 
-        if (!prefs_.getBool("initialized", false)) {
-            prefs_.putBool("initialized", true);
+        // Keep the compiled firmware credentials synchronized
+        // with persistent storage on every startup.
+        syncFirmwareCredentials();
 
-            if (count_ == 0 && strlen(WIFI_SSID) > 0) {
-                profiles_[0] = {
-                    String(WIFI_SSID),
-                    String(WIFI_PASSWORD)
-                };
-
-                count_ = 1;
-                persist();
-            }
-        }
-
+        // During the temporary diagnostic build, start the AP *before*
+        // attempting any saved networks, so the board is inspectable.
+#if HIDLAB_STARTUP_DIAGNOSTICS
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.setAutoReconnect(false);
+        startAccessPoint();
+#else
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(false);
-        startCycle(-1);
+#endif
+
+        // Always try the firmware-configured network first.
+        startCycle(0);
     }
 
-    /** Progress connection attempts and manage fallback setup Wi-Fi. */
+    /**
+     * Maintain Wi-Fi connectivity and the configured retry policy.
+     */
     void update() {
         if (reconfigureAt_ != 0 &&
-            static_cast<int32_t>(millis() - reconfigureAt_) >= 0) {
+            static_cast<int32_t>(
+                millis() - reconfigureAt_
+            ) >= 0) {
 
             reconfigureAt_ = 0;
+
             WiFi.disconnect();
+
             connectedIndex_ = -1;
             wasConnected_ = false;
+
             stopMdns();
-            startCycle(-1);
+            startCycle(0);
         }
 
         if (WiFi.status() == WL_CONNECTED) {
             if (!wasConnected_) {
                 wasConnected_ = true;
                 ++generation_;
-                everConnected_ = true;
+
                 trying_ = false;
                 exhausted_ = false;
 
-                connectedIndex_ = orderPos_ < orderCount_
+                connectedIndex_ =
+                    orderPos_ < orderCount_
                     ? order_[orderPos_]
                     : -1;
+
+                Serial.print("Connected to: ");
+                Serial.println(WiFi.SSID());
 
                 Serial.print("HIDLab IP: http://");
                 Serial.println(WiFi.localIP());
 
-                if (MDNS.begin("hidlab")) {
+                if (!mdnsRunning_ && MDNS.begin("hidlab")) {
                     mdnsRunning_ = true;
                     MDNS.addService("http", "tcp", 80);
                 }
 
+                // Keep diagnostic AP available even when STA connects.
+                // Normal builds retain the original fallback-only design.
+#if !HIDLAB_STARTUP_DIAGNOSTICS
                 if (apActive_) {
                     WiFi.softAPdisconnect(false);
                     apActive_ = false;
                     WiFi.mode(WIFI_STA);
                 }
+#endif
             }
 
             return;
@@ -88,20 +114,28 @@ public:
         if (wasConnected_) {
             wasConnected_ = false;
             ++generation_;
+
             stopMdns();
+
+            // Retry the previously connected network first.
             startCycle(connectedIndex_);
         }
 
-        if (exhausted_ || !trying_) return;
+        if (exhausted_ || !trying_) {
+            return;
+        }
 
         if (millis() - attemptAt_ < CONNECT_TIMEOUT_MS) {
             return;
         }
 
         WiFi.disconnect();
+
         ++attemptsOnProfile_;
 
-        const int maxAttempts = orderPos_ == 0 ? 3 : 1;
+        // First network gets three attempts; others get one.
+        const int maxAttempts =
+            orderPos_ == 0 ? 3 : 1;
 
         if (attemptsOnProfile_ >= maxAttempts) {
             ++orderPos_;
@@ -111,12 +145,14 @@ public:
         attemptNext();
     }
 
-    /** Add or update a saved Wi-Fi profile. */
-    bool addOrUpdate(const String& ssid, const String& password) {
-        if (ssid.isEmpty() ||
-            ssid.length() > 32 ||
-            !(password.isEmpty() ||
-              (password.length() >= 8 && password.length() <= 63))) {
+    /**
+     * Add or update a persistent Wi-Fi network.
+     */
+    bool addOrUpdate(
+        const String& ssid,
+        const String& password
+    ) {
+        if (!validCredentials(ssid, password)) {
             return false;
         }
 
@@ -130,14 +166,16 @@ public:
         }
 
         if (index < 0) {
-            if (count_ >= MAX_NETWORKS) return false;
+            if (count_ >= MAX_NETWORKS) {
+                return false;
+            }
+
             index = count_++;
         }
 
         profiles_[index] = {ssid, password};
         persist();
 
-        // Wait for the HTTP response before changing connections.
         if (!connected() || connectedIndex_ == index) {
             scheduleReconnect();
         }
@@ -145,16 +183,23 @@ public:
         return true;
     }
 
+    /**
+     * Remove a saved network.
+     */
     bool remove(int index) {
-        if (index < 0 || index >= count_) return false;
+        if (index < 0 || index >= count_) {
+            return false;
+        }
 
-        const bool removingCurrent = index == connectedIndex_;
+        const bool removingCurrent =
+            index == connectedIndex_;
 
         for (int i = index; i < count_ - 1; ++i) {
             profiles_[i] = profiles_[i + 1];
         }
 
         profiles_[--count_] = {"", ""};
+
         persist();
 
         if (removingCurrent || !connected()) {
@@ -193,12 +238,20 @@ public:
     }
 
     String currentSSID() const {
-        return connected() ? WiFi.SSID() : String();
+        return connected()
+            ? WiFi.SSID()
+            : String();
     }
 
     String address() const {
-        if (connected()) return WiFi.localIP().toString();
-        if (apActive_) return WiFi.softAPIP().toString();
+        if (connected()) {
+            return WiFi.localIP().toString();
+        }
+
+        if (apActive_) {
+            return WiFi.softAPIP().toString();
+        }
+
         return String();
     }
 
@@ -213,6 +266,7 @@ private:
 
     int count_ = 0;
     uint32_t generation_ = 0;
+
     int order_[MAX_NETWORKS] = {};
     int orderCount_ = 0;
     int orderPos_ = 0;
@@ -221,7 +275,6 @@ private:
 
     bool trying_ = false;
     bool wasConnected_ = false;
-    bool everConnected_ = false;
     bool exhausted_ = false;
     bool apActive_ = false;
     bool mdnsRunning_ = false;
@@ -229,6 +282,25 @@ private:
     unsigned long attemptAt_ = 0;
     unsigned long reconfigureAt_ = 0;
 
+    /**
+     * Validate WPA password length and SSID length.
+     */
+    static bool validCredentials(
+        const String& ssid,
+        const String& password
+    ) {
+        return !ssid.isEmpty() &&
+               ssid.length() <= 32 &&
+               (
+                   password.isEmpty() ||
+                   (password.length() >= 8 &&
+                    password.length() <= 63)
+               );
+    }
+
+    /**
+     * Load existing persistent network profiles.
+     */
     void load() {
         count_ = constrain(
             prefs_.getInt("count", 0),
@@ -239,14 +311,83 @@ private:
         for (int i = 0; i < count_; ++i) {
             const String key = "wifi" + String(i);
 
-            profiles_[i].ssid =
-                prefs_.getString((key + "s").c_str(), "");
+            profiles_[i].ssid = prefs_.getString(
+                (key + "s").c_str(),
+                ""
+            );
 
-            profiles_[i].password =
-                prefs_.getString((key + "p").c_str(), "");
+            profiles_[i].password = prefs_.getString(
+                (key + "p").c_str(),
+                ""
+            );
         }
     }
 
+    /**
+     * Synchronize the configured network on every startup.
+     *
+     * If the firmware's SSID changed, replace the previous
+     * primary network. Other saved profiles remain intact.
+     *
+     * If the configured SSID is already saved elsewhere,
+     * move it into the primary position.
+     */
+    void syncFirmwareCredentials() {
+        const String ssid(WIFI_SSID);
+        const String password(WIFI_PASSWORD);
+
+        if (!validCredentials(ssid, password)) {
+            Serial.println(
+                "No valid firmware Wi-Fi credentials configured."
+            );
+            return;
+        }
+
+        // Same SSID: update its password only if changed.
+        if (count_ > 0 && profiles_[0].ssid == ssid) {
+            if (profiles_[0].password != password) {
+                profiles_[0].password = password;
+                persist();
+
+                Serial.println(
+                    "Primary Wi-Fi password updated."
+                );
+            }
+
+            return;
+        }
+
+        int existingIndex = -1;
+
+        for (int i = 1; i < count_; ++i) {
+            if (profiles_[i].ssid == ssid) {
+                existingIndex = i;
+                break;
+            }
+        }
+
+        if (existingIndex >= 0) {
+            // Move an already-saved network to first priority.
+            for (int i = existingIndex; i > 0; --i) {
+                profiles_[i] = profiles_[i - 1];
+            }
+
+        } else if (count_ == 0) {
+            count_ = 1;
+        }
+
+        // Replace the old primary when the SSID changes.
+        profiles_[0] = {ssid, password};
+
+        persist();
+
+        Serial.print("Primary Wi-Fi synchronized: ");
+        Serial.println(ssid);
+    }
+
+    /**
+     * Save network profiles only when they change.
+     */
     void persist() {
         prefs_.putInt("count", count_);
 
@@ -255,29 +396,46 @@ private:
 
             prefs_.putString(
                 (key + "s").c_str(),
-                i < count_ ? profiles_[i].ssid : String()
+                i < count_
+                    ? profiles_[i].ssid
+                    : String()
             );
 
             prefs_.putString(
                 (key + "p").c_str(),
-                i < count_ ? profiles_[i].password : String()
+                i < count_
+                    ? profiles_[i].password
+                    : String()
             );
         }
     }
 
+    /**
+     * Stop the currently registered mDNS service.
+     */
     void stopMdns() {
-        if (mdnsRunning_) MDNS.end();
+        if (mdnsRunning_) {
+            MDNS.end();
+        }
+
         mdnsRunning_ = false;
     }
 
+    /**
+     * Delay reconnection until the HTTP response is sent.
+     */
     void scheduleReconnect() {
         reconfigureAt_ = millis() + 1500;
     }
 
-    /** Prefer a visible saved network or the last connected one. */
+    /**
+     * Construct the retry order, placing the preferred
+     * network first.
+     */
     void startCycle(int preferredIndex) {
         exhausted_ = false;
         trying_ = false;
+
         orderCount_ = 0;
         orderPos_ = 0;
         attemptsOnProfile_ = 0;
@@ -287,26 +445,9 @@ private:
             return;
         }
 
-        if (preferredIndex < 0 || preferredIndex >= count_) {
-            const int found = WiFi.scanNetworks(false, false);
-            int strongest = -999;
-
-            for (int scan = 0; scan < found; ++scan) {
-                for (int i = 0; i < count_; ++i) {
-                    if (WiFi.SSID(scan) == profiles_[i].ssid &&
-                        WiFi.RSSI(scan) > strongest) {
-
-                        preferredIndex = i;
-                        strongest = WiFi.RSSI(scan);
-                    }
-                }
-            }
-
-            WiFi.scanDelete();
-
-            if (preferredIndex < 0) {
-                preferredIndex = 0;
-            }
+        if (preferredIndex < 0 ||
+            preferredIndex >= count_) {
+            preferredIndex = 0;
         }
 
         order_[orderCount_++] = preferredIndex;
@@ -320,15 +461,21 @@ private:
         attemptNext();
     }
 
+    /**
+     * Connect to the selected saved Wi-Fi profile.
+     */
     void attemptNext() {
         if (orderPos_ >= orderCount_) {
             finishCycle();
             return;
         }
 
-        const Profile& profile = profiles_[order_[orderPos_]];
+        const Profile& profile =
+            profiles_[order_[orderPos_]];
 
-        WiFi.mode(apActive_ ? WIFI_AP_STA : WIFI_STA);
+        WiFi.mode(
+            apActive_ ? WIFI_AP_STA : WIFI_STA
+        );
 
         WiFi.begin(
             profile.ssid.c_str(),
@@ -342,23 +489,38 @@ private:
         Serial.println(profile.ssid);
     }
 
+    /**
+     * Enter fallback setup mode if initial Wi-Fi
+     * connection attempts fail.
+     */
     void finishCycle() {
         trying_ = false;
         exhausted_ = true;
 
-        // After losing a working connection, wait for device restart.
-        if (!everConnected_) {
+        if (!apActive_) {
             startAccessPoint();
         }
 
-        Serial.println("Saved Wi-Fi attempts exhausted");
+        Serial.println(
+            "Saved Wi-Fi connection attempts exhausted."
+        );
     }
 
+    /**
+     * Start the password-protected setup network.
+     */
     void startAccessPoint() {
-        if (apActive_) return;
+        if (apActive_) {
+            return;
+        }
 
-        if (strlen(HIDLAB_SETUP_PASSWORD) < 8) {
-            Serial.println("Setup password must be at least 8 characters");
+        // Use the user's existing private setup password for diagnostics.
+        const char* apPassword = HIDLAB_SETUP_PASSWORD;
+
+        if (strlen(apPassword) < 8) {
+            Serial.println(
+                "Setup password must contain at least 8 characters."
+            );
             return;
         }
 
@@ -366,7 +528,7 @@ private:
 
         apActive_ = WiFi.softAP(
             "HIDLab-Setup",
-            HIDLAB_SETUP_PASSWORD
+            apPassword
         );
 
         if (apActive_) {
@@ -374,6 +536,10 @@ private:
 
             Serial.print("Setup AP: http://");
             Serial.println(WiFi.softAPIP());
+        } else {
+            Serial.println(
+                "Failed to start HIDLab setup AP."
+            );
         }
     }
 };

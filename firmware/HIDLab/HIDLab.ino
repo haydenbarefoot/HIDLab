@@ -4,7 +4,13 @@
  * Arduino Nano ESP32 Wi-Fi-controlled USB HID keyboard.
  */
 
+// TEMPORARY DIAGNOSTIC BUILD.
+// 1: advertise an AP on every boot for startup debugging.
+// 0: return to the original fallback-only network behavior.
+#define HIDLAB_STARTUP_DIAGNOSTICS 1
+
 #include <Arduino.h>
+#include <esp_system.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
@@ -28,6 +34,13 @@ HumanTypingEngine typing;
 
 volatile bool usbReady = false;
 volatile bool usbLost = false;
+volatile bool usbEverMounted = false;
+volatile bool usbSuspended = false;
+
+uint8_t startupStage = 0;
+uint32_t mainLoopCount = 0;
+unsigned long lastLedToggle = 0;
+bool onboardLedOn = false;
 
 bool pausedByUsb = false;
 
@@ -49,13 +62,18 @@ static void usbEvent(
 
     if (event == ARDUINO_USB_STARTED_EVENT ||
         event == ARDUINO_USB_RESUME_EVENT) {
-
         usbReady = true;
+        usbSuspended = false;
+        usbEverMounted = true;
 
-    } else if (
-        event == ARDUINO_USB_STOPPED_EVENT ||
-        event == ARDUINO_USB_SUSPEND_EVENT
-    ) {
+    } else if (event == ARDUINO_USB_SUSPEND_EVENT) {
+        // A sleeping USB host is different from a removed USB cable.
+        usbSuspended = true;
+        usbReady = false;
+        usbLost = true;
+
+    } else if (event == ARDUINO_USB_STOPPED_EVENT) {
+        usbSuspended = false;
         usbReady = false;
         usbLost = true;
     }
@@ -199,6 +217,30 @@ void handleRoot() {
         "text/html; charset=utf-8",
         INDEX_HTML
     );
+}
+
+
+/** Temporary read-only startup diagnostics (no passwords exposed). */
+void handleDiagnostic() {
+    JsonDocument report;
+    report["diagnostic_build"] = true;
+    report["uptime_seconds"] = millis() / 1000;
+    report["loop_count"] = mainLoopCount;
+    report["startup_stage"] = startupStage;
+    report["reset_reason_code"] = static_cast<int>(esp_reset_reason());
+    report["network_connected"] = networks.connected();
+    report["setup_ap_active"] = networks.setupMode();
+    report["network_attempts_exhausted"] = networks.exhausted();
+    report["ip"] = networks.address();
+    report["usb_ready_now"] = static_cast<bool>(usbReady);
+    report["usb_ever_mounted"] = static_cast<bool>(usbEverMounted);
+    report["usb_suspended"] = static_cast<bool>(usbSuspended);
+    report["queue_state"] = queue.statusName();
+
+    String body;
+    serializeJsonPretty(report, body);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "text/plain; charset=utf-8", body);
 }
 
 
@@ -525,6 +567,7 @@ void configureServer() {
     server.collectHeaders(headers, 1);
 
     server.on("/", HTTP_GET, handleRoot);
+    server.on("/diagnostic", HTTP_GET, handleDiagnostic);
 
     server.on(
         "/api/session",
@@ -578,7 +621,7 @@ void configureServer() {
         sendError(404, "Not found.");
     });
 
-    server.begin();
+    // server.begin() is intentionally called in setup(), AFTER Wi-Fi is initialized.
 }
 
 
@@ -600,26 +643,49 @@ void maintainUsb() {
 
 /** Initialize HIDLab services. */
 void setup() {
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
     Serial.begin(115200);
+    startupStage = 1;
+    Serial.println("HIDLab: starting USB");
 
     USB.onEvent(usbEvent);
-
     Keyboard.begin();
     USB.begin();
+    startupStage = 2;
 
+    Serial.println("HIDLab: loading typing preferences");
     typing.begin();
+    startupStage = 3;
 
+    Serial.println("HIDLab: registering HTTP routes");
     configureServer();
+    startupStage = 4;
+
+    Serial.println("HIDLab: starting Wi-Fi");
     networks.begin();
+    startupStage = 5;
+
+    // The working hardware diagnostic started its web server only
+    // after bringing up Wi-Fi. Use the same order here.
+    server.begin();
+    startupStage = 6;
 
     networkGeneration = networks.generation();
-
     Serial.println("HIDLab ready");
 }
 
 
 /** Service networking, HTTP requests, and keyboard playback. */
 void loop() {
+    ++mainLoopCount;
+    // A visible heartbeat confirms that the actual HIDLab loop is running.
+    if (millis() - lastLedToggle >= 500) {
+        lastLedToggle = millis();
+        onboardLedOn = !onboardLedOn;
+        digitalWrite(LED_BUILTIN, onboardLedOn ? HIGH : LOW);
+    }
+
     maintainUsb();
 
     networks.update();
