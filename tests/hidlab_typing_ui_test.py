@@ -1,32 +1,51 @@
 
-"""Serve the final HIDLab webpage with simulated typing settings.
+"""Desktop simulator for HIDLab's typing settings interface.
 
-Place alongside hidlab_desktop_test.py and run from VS Code.
-Visit http://localhost:8002. No USB keyboard output is generated.
+Run this file using VS Code's Run Python File command.
+Open http://localhost:8002 in your browser.
+
+USB keyboard output and Wi-Fi connections are simulated.
 """
 
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 import importlib.util
 
-SOURCE = Path(__file__).with_name("hidlab_desktop_test.py")
-spec = importlib.util.spec_from_file_location("hidlab_base_simulator", SOURCE)
+SOURCE = Path(__file__).with_name(
+    "hidlab_desktop_test.py"
+)
+
+spec = importlib.util.spec_from_file_location(
+    "hidlab_base_simulator",
+    SOURCE,
+)
+
 sim = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sim)
 
-settings = {"mode": "standard", "wpm": 35, "typo_rate": 3}
+settings = {
+    "mode": "standard",
+    "min_wpm": 30,
+    "max_wpm": 35,
+    "typo_rate": 3,
+}
 
 
 class Handler(sim.Handler):
-    """Extend the desktop simulator with typing settings endpoints."""
+    """Extend the desktop API with adjustable typing profiles."""
 
     def do_GET(self):
         if self.path != "/api/settings":
             return super().do_GET()
 
         with sim.lock:
-            if self.authorized():
-                self.send_json(200, settings.copy())
+            if not self.authorized():
+                return
+
+            response = settings.copy()
+            response["current_wpm"] = settings["min_wpm"]
+
+            self.send_json(200, response)
 
     def do_POST(self):
         if self.path != "/api/settings":
@@ -37,46 +56,69 @@ class Handler(sim.Handler):
                 return
 
             payload = self.read_json()
+
             if payload is None:
                 return
 
             if sim.state != "idle":
-                self.send_json(409, {
-                    "ok": False,
-                    "error": "Stop playback before changing typing settings.",
-                })
+                self.send_json(
+                    409,
+                    {
+                        "ok": False,
+                        "error": (
+                            "Stop playback before "
+                            "changing typing settings."
+                        ),
+                    },
+                )
                 return
 
             mode = payload.get("mode")
-            wpm = payload.get("wpm")
+            min_wpm = payload.get("min_wpm")
+            max_wpm = payload.get("max_wpm")
             typo_rate = payload.get("typo_rate")
 
             valid = (
                 mode in ("standard", "humanized")
-                and type(wpm) is int and 15 <= wpm <= 100
-                and type(typo_rate) is int and 0 <= typo_rate <= 10
+                and type(min_wpm) is int
+                and type(max_wpm) is int
+                and type(typo_rate) is int
+                and 15 <= min_wpm <= 100
+                and 15 <= max_wpm <= 100
+                and min_wpm <= max_wpm
+                and 0 <= typo_rate <= 10
             )
 
             if valid:
                 settings.update(
                     mode=mode,
-                    wpm=wpm,
+                    min_wpm=min_wpm,
+                    max_wpm=max_wpm,
                     typo_rate=typo_rate,
                 )
 
-            self.send_json(200 if valid else 400, {
-                "ok": valid,
-                "message": (
-                    "Typing settings saved."
-                    if valid else "Invalid settings."
-                ),
-            })
+            self.send_json(
+                200 if valid else 400,
+                {
+                    "ok": valid,
+                    "message": (
+                        "Typing settings saved."
+                        if valid
+                        else "Invalid typing settings."
+                    ),
+                },
+            )
 
 
-if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", 8002), Handler)
-    print("HIDLab typing UI simulator: http://localhost:8002")
-    print("USB output and actual typing rhythm are not simulated.")
+def main():
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 8002),
+        Handler,
+    )
+
+    print("HIDLab typing settings simulator")
+    print("Open http://localhost:8002")
+    print("No USB keyboard output is generated.")
 
     try:
         server.serve_forever()
@@ -84,3 +126,7 @@ if __name__ == "__main__":
         pass
     finally:
         server.server_close()
+
+
+if __name__ == "__main__":
+    main()
