@@ -688,6 +688,7 @@ input:focus-visible {
 const $ = id => document.getElementById(id);
 
 const tokenKey = "hidlab-controller-token";
+const sessionHeader = "X-HIDLab-Session";
 let token;
 
 try {
@@ -823,11 +824,7 @@ async function claimSession() {
 /** Request control after releasing or losing a session. */
 async function requestControl() {
   autoClaim = true;
-
-  await claimSession();
-  await refresh();
-  await refreshSettings();
-  await refreshNetworks();
+  await syncController();
 }
 
 
@@ -841,7 +838,7 @@ async function releaseControl() {
     await fetch("/api/release", {
       method: "POST",
       headers: {
-        "X-HIDLab-Session": token
+        [sessionHeader]: token
       }
     });
   } catch {}
@@ -872,7 +869,7 @@ async function post(path, payload) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-HIDLab-Session": token
+        [sessionHeader]: token
       },
       body: JSON.stringify(payload)
     });
@@ -904,7 +901,7 @@ async function post(path, payload) {
 async function getApi(path) {
   const response = await fetch(path, {
     headers: {
-      "X-HIDLab-Session": token
+      [sessionHeader]: token
     },
     cache: "no-store"
   });
@@ -1311,15 +1308,20 @@ async function removeNetwork(index) {
 }
 
 
-/** Start the interface and background status polling. */
-async function initialize() {
-  selectMode("standard");
-  updateRangeLabels();
-
+/** Claim control and load the current device state. */
+async function syncController() {
   await claimSession();
   await refresh();
   await refreshSettings();
   await refreshNetworks();
+}
+
+
+/** Start the interface and background status polling. */
+async function initialize() {
+  selectMode("standard");
+  updateRangeLabels();
+  await syncController();
 
   setInterval(refresh, 1500);
   setInterval(claimSession, 8000);

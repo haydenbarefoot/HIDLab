@@ -24,6 +24,7 @@
 
 constexpr unsigned long SESSION_LEASE_MS = 30000;
 constexpr size_t MAX_REQUEST_BYTES = 32000;
+constexpr char SESSION_HEADER[] = "X-HIDLab-Session";
 
 WebServer server(80);
 USBHIDKeyboard Keyboard;
@@ -106,6 +107,19 @@ void sendError(int code, const char* message) {
 }
 
 
+void sendResult(bool ok, const char* message) {
+    JsonDocument response;
+    response["ok"] = ok;
+    response["message"] = message;
+    sendJson(ok ? 200 : 400, response);
+}
+
+int requestIndex(const JsonDocument& request) {
+    const JsonVariantConst index = request["index"];
+    return index.is<int>() ? index.as<int>() : -1;
+}
+
+
 /** Parse and validate a JSON request body. */
 bool readJson(JsonDocument& data) {
     if (!server.hasArg("plain")) {
@@ -133,15 +147,17 @@ bool readJson(JsonDocument& data) {
 }
 
 
+bool hasActiveController() {
+    return !controllerToken.isEmpty() &&
+           millis() - lastControllerAt < SESSION_LEASE_MS;
+}
+
+
 /** Verify the active browser controller session. */
 bool authorized() {
-    const String token =
-        server.header("X-HIDLab-Session");
+    const String token = server.header(SESSION_HEADER);
 
-    if (controllerToken.isEmpty() ||
-        millis() - lastControllerAt >= SESSION_LEASE_MS ||
-        token != controllerToken) {
-
+    if (!hasActiveController() || token != controllerToken) {
         sendError(
             423,
             "Controller unavailable. Reconnect from the webpage."
@@ -177,10 +193,7 @@ void handleSession() {
         return;
     }
 
-    if (!controllerToken.isEmpty() &&
-        token != controllerToken &&
-        millis() - lastControllerAt < SESSION_LEASE_MS) {
-
+    if (token != controllerToken && hasActiveController()) {
         sendError(423, "Another browser has control.");
         return;
     }
@@ -297,9 +310,7 @@ void handleAction() {
     const String command =
         request["action"] | "";
 
-    const int index = request["index"].is<int>()
-        ? request["index"].as<int>()
-        : -1;
+    const int index = requestIndex(request);
 
     bool ok = false;
     const char* message = "Unknown action.";
@@ -413,12 +424,7 @@ void handleAction() {
             : "Already idle.";
     }
 
-    JsonDocument response;
-
-    response["ok"] = ok;
-    response["message"] = message;
-
-    sendJson(ok ? 200 : 400, response);
+    sendResult(ok, message);
 }
 
 
@@ -476,15 +482,7 @@ void handleSaveSettings() {
         request["typo_rate"].as<int>()
     );
 
-    JsonDocument response;
-
-    response["ok"] = ok;
-
-    response["message"] = ok
-        ? "Typing settings saved."
-        : "Invalid typing settings.";
-
-    sendJson(ok ? 200 : 400, response);
+    sendResult(ok, ok ? "Typing settings saved." : "Invalid typing settings.");
 }
 
 
@@ -539,30 +537,17 @@ void handleNetworkAction() {
 
     } else if (command == "remove") {
 
-        const int index = request["index"].is<int>()
-            ? request["index"].as<int>()
-            : -1;
-
-        ok = networks.remove(index);
+        ok = networks.remove(requestIndex(request));
     }
 
-    JsonDocument response;
-
-    response["ok"] = ok;
-
-    response["message"] = ok
-        ? "Network saved. Connection may change."
-        : "Network change rejected.";
-
-    sendJson(ok ? 200 : 400, response);
+    sendResult(ok, ok ? "Network saved. Connection may change."
+                      : "Network change rejected.");
 }
 
 
 /** Register the HTTP API. */
 void configureServer() {
-    const char* headers[] = {
-        "X-HIDLab-Session"
-    };
+    const char* headers[] = {SESSION_HEADER};
 
     server.collectHeaders(headers, 1);
 
@@ -666,8 +651,7 @@ void setup() {
     networks.begin();
     startupStage = 5;
 
-    // The working hardware diagnostic started its web server only
-    // after bringing up Wi-Fi. Use the same order here.
+    // Start accepting requests once Wi-Fi is initialized.
     server.begin();
     startupStage = 6;
 

@@ -2,7 +2,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <ctype.h>
 
 class PassageQueue {
 public:
@@ -12,18 +11,21 @@ public:
     enum class State { Idle, Typing, Paused };
 
     static bool validText(const String& text) {
-        if (text.isEmpty() || text.length() > MAX_CHARACTERS) return false;
+        if (text.isEmpty() || text.length() > MAX_CHARACTERS) {
+            return false;
+        }
 
         bool nonWhitespace = false;
 
         for (size_t i = 0; i < text.length(); ++i) {
             const unsigned char c = static_cast<unsigned char>(text[i]);
+            const bool lineBreak = c == '\n' || c == '\r';
 
-            if (!((c >= 32 && c <= 126) || c == '\n' || c == '\r')) {
+            if (!lineBreak && (c < 32 || c > 126)) {
                 return false;
             }
 
-            if (c != ' ' && c != '\n' && c != '\r') {
+            if (!lineBreak && c != ' ') {
                 nonWhitespace = true;
             }
         }

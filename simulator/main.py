@@ -14,6 +14,8 @@ WEB_FILE = Path(__file__).resolve().parent.parent / "web" / "index.html"
 
 MAX_PASSAGES = 2
 MAX_CHARACTERS = 12000
+MAX_REQUEST_BYTES = 100000
+KEY_INTERVAL_SECONDS = 0.15
 
 lock = threading.Lock()
 queue = deque()
@@ -51,10 +53,13 @@ def perform(action, text="", index=None, direction=None):
     global current_text, position, state
 
     with lock:
-        if action == "add":
-            if not valid_text(text):
-                return False, "Enter text between 1 and 12,000 characters."
+        if action in ("remove", "edit", "move") and not valid_index(index):
+            return False, "Invalid queue position."
 
+        if action in ("add", "edit") and not valid_text(text):
+            return False, "Enter text between 1 and 12,000 characters."
+
+        if action == "add":
             # Include the active passage when enforcing queue capacity.
             active_count = int(current_text is not None)
 
@@ -65,26 +70,14 @@ def perform(action, text="", index=None, direction=None):
             return True, "Passage added."
 
         if action == "remove":
-            if not valid_index(index):
-                return False, "Invalid queue position."
-
             del queue[index]
             return True, "Passage removed."
 
         if action == "edit":
-            if not valid_index(index):
-                return False, "Invalid queue position."
-
-            if not valid_text(text):
-                return False, "Enter text between 1 and 12,000 characters."
-
             queue[index] = text
             return True, "Passage updated."
 
         if action == "move":
-            if not valid_index(index):
-                return False, "Invalid queue position."
-
             if direction not in ("up", "down"):
                 return False, "Invalid move direction."
 
@@ -136,17 +129,23 @@ def perform(action, text="", index=None, direction=None):
             if current_text is not None:
                 queue.appendleft(current_text)
 
-            current_text = None
-            position = 0
-            state = "idle"
+            _clear_playback()
             return True, "Stopped. Passage returned to queue."
 
         return False, "Unknown action."
 
 
+def _clear_playback():
+    """Reset the active passage while the caller holds the state lock."""
+    global current_text, position, state
+    current_text = None
+    position = 0
+    state = "idle"
+
+
 def keyboard_worker():
     """Log simulated keyboard events independently of HTTP requests."""
-    global current_text, position, state
+    global position
 
     while True:
         output = None
@@ -160,9 +159,7 @@ def keyboard_worker():
 
                 if position >= len(current_text):
                     finished = True
-                    current_text = None
-                    position = 0
-                    state = "idle"
+                    _clear_playback()
 
         if output is not None:
             print(f"[SIMULATED KEY] {output!r}", flush=True)
@@ -170,8 +167,7 @@ def keyboard_worker():
         if finished:
             print("[SIMULATOR] Passage completed.", flush=True)
 
-        # Fixed delay keeps playback observable during simulator testing.
-        time.sleep(0.15)
+        time.sleep(KEY_INTERVAL_SECONDS)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -223,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
 
-            if not 1 <= length <= 100000:
+            if not 1 <= length <= MAX_REQUEST_BYTES:
                 self.respond(413, {"error": "Invalid request size"})
                 return
 
@@ -244,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": ok, "message": message},
             )
 
-        except (ValueError, json.JSONDecodeError):
+        except ValueError:
             self.respond(400, {"error": "Invalid JSON request"})
 
 

@@ -156,14 +156,7 @@ public:
             return false;
         }
 
-        int index = -1;
-
-        for (int i = 0; i < count_; ++i) {
-            if (profiles_[i].ssid == ssid) {
-                index = i;
-                break;
-            }
-        }
+        int index = findProfile(ssid);
 
         if (index < 0) {
             if (count_ >= MAX_NETWORKS) {
@@ -282,6 +275,15 @@ private:
     unsigned long attemptAt_ = 0;
     unsigned long reconfigureAt_ = 0;
 
+    int findProfile(const String& ssid, int start = 0) const {
+        for (int i = start; i < count_; ++i) {
+            if (profiles_[i].ssid == ssid) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     /**
      * Validate WPA password length and SSID length.
      */
@@ -357,14 +359,7 @@ private:
             return;
         }
 
-        int existingIndex = -1;
-
-        for (int i = 1; i < count_; ++i) {
-            if (profiles_[i].ssid == ssid) {
-                existingIndex = i;
-                break;
-            }
-        }
+        const int existingIndex = findProfile(ssid, 1);
 
         if (existingIndex >= 0) {
             // Move an already-saved network to first priority.

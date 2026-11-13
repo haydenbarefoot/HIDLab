@@ -354,15 +354,14 @@
       }
 
       editingIndex = index;
+      const input = document.getElementById("editInput");
 
       document.getElementById("editTitle").textContent =
         `Edit Passage ${index + 1}`;
 
-      document.getElementById("editInput").value =
-        passages[index];
-
+      input.value = passages[index];
       document.getElementById("editPanel").hidden = false;
-      document.getElementById("editInput").focus();
+      input.focus();
     }
 
     /**
@@ -482,8 +481,7 @@
           )
         );
 
-        item.appendChild(preview);
-        item.appendChild(actions);
+        item.append(preview, actions);
         list.appendChild(item);
       });
     }

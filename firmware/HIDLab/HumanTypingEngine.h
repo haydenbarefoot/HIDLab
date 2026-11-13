@@ -136,7 +136,7 @@ public:
         );
 
         wordsUntilChange_ = random(3, 8);
-        dueAt_ = millis() + 250;
+        resume();
     }
 
     /**
@@ -198,20 +198,10 @@ public:
             return;
         }
 
-        if (phase_ == Phase::TypeCorrect) {
-            if (keyboard.write(
-                static_cast<uint8_t>(expected)
-            ) == 1) {
-                phase_ = Phase::Ready;
-                queue.advance();
-                scheduleNext(now, expected);
-            }
-            return;
-        }
-
         char incorrect;
 
-        if (mode_ == Mode::Humanized &&
+        if (phase_ == Phase::Ready &&
+            mode_ == Mode::Humanized &&
             typoRate_ > 0 &&
             random(100) < typoRate_ &&
             nearbyLetter(expected, incorrect)) {
@@ -229,6 +219,7 @@ public:
         if (keyboard.write(
             static_cast<uint8_t>(expected)
         ) == 1) {
+            phase_ = Phase::Ready;
             queue.advance();
             scheduleNext(now, expected);
         }
